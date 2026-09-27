@@ -1,0 +1,34 @@
+# Minimal Blocky 0.25 configuration for a public DoH service.
+# The public listener is the Go DNS-only gateway; Blocky stays private on loopback.
+
+minTlsServeVersion: 1.2
+connectIPVersion: v4
+
+upstreams:
+  strategy: random
+  timeout: 1500ms
+  groups:
+    default:
+      - https://root.hagezi.org/dns-query
+      - https://wurzn.hagezi.org/dns-query
+      - https://juuri.hagezi.org/dns-query
+
+ports:
+  dns:
+  tls:
+  https:
+  http: 127.0.0.1:8053
+  dohPath: /dns-query
+
+# Keep memory predictable on the 512 MB tier.
+caching:
+  maxItemsCount: 65536
+  prefetching: false
+  cacheTimeNegative: 5m
+
+# No blocklists, statistics, Prometheus, API, or query logging: this is a lean resolver.
+log:
+  level: warn
+  format: text
+  timestamp: true
+  privacy: true

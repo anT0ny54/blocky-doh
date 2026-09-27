@@ -1,0 +1,11 @@
+services:
+  hagezi-doh:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      RATE_LIMIT: "99"
+      MAX_CLIENTS: "131072"
+      MAX_CONCURRENT: "256"
+      TRUST_PROXY: "false"
+    restart: unless-stopped
