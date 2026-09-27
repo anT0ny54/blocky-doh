@@ -15,8 +15,12 @@ COPY main.go main_test.go ./
 RUN go test ./...
 RUN go build -trimpath -ldflags='-s -w' -o /out/doh-gateway .
 
-# Build the requested Blocky release from its immutable tag.
-RUN go install -trimpath -ldflags='-s -w' github.com/0xERR0R/blocky@${BLOCKY_VERSION}
+# Blocky v0.25 uses a Git tag named v0.25 (not a Go-semver v0.25.0 module version).
+# Clone that exact tag, then build it from source.
+RUN git clone --depth 1 --branch "${BLOCKY_VERSION}" --single-branch https://github.com/0xERR0R/blocky.git /tmp/blocky && \
+    cd /tmp/blocky && \
+    go build -trimpath -ldflags='-s -w' -o /out/blocky . && \
+    rm -rf /tmp/blocky
 
 # Final runtime: Alpine 3.24, no Go toolchain kept in the image.
 FROM alpine:3.24
@@ -26,7 +30,7 @@ RUN apk add --no-cache ca-certificates && \
     mkdir -p /etc/blocky && chown -R app:app /etc/blocky
 
 COPY --from=builder /out/doh-gateway /doh-gateway
-COPY --from=builder /go/bin/blocky /blocky
+COPY --from=builder /out/blocky /blocky
 COPY config.yml /etc/blocky/config.yml
 COPY entrypoint.sh /entrypoint.sh
 
