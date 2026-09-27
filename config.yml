@@ -33,7 +33,6 @@ ports:
   tls:
   https:
   http: 127.0.0.1:8053
-  dohPath: /dns-query
 
 # Keep memory predictable on the 512 MB tier.
 caching:
