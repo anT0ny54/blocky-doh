@@ -23,6 +23,6 @@ sleep 0.2
 /doh-gateway &
 GATEWAY_PID=$!
 
-wait -n "$BLOCKY_PID" "$GATEWAY_PID"
+wait -n
 status=$?
 exit "$status"

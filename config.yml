@@ -4,9 +4,24 @@
 minTlsServeVersion: 1.2
 connectIPVersion: v4
 
+# Prevent bootstrap lookups for the DoH upstream hostnames from falling back to
+# the container's general-purpose resolver. The IPs are used only to reach the
+# named HTTPS endpoints; TLS still uses the configured hostnames/SNI.
+bootstrapDns:
+  - upstream: https://root.hagezi.org/dns-query
+    ips:
+      - 188.34.161.210
+  - upstream: https://wurzn.hagezi.org/dns-query
+    ips:
+      - 159.69.155.94
+  - upstream: https://juuri.hagezi.org/dns-query
+    ips:
+      - 95.217.163.17
+
 upstreams:
   strategy: random
-  timeout: 1500ms
+  # Keep each failed upstream attempt below the gateway's 3s request deadline.
+  timeout: 1200ms
   groups:
     default:
       - https://root.hagezi.org/dns-query

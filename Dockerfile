@@ -1,4 +1,4 @@
-# Builder: exact Go version requested for the DNS gateway and Blocky 0.25 build.
+# Builder: exact current supported Go toolchain for the DNS gateway and Blocky 0.25 build.
 FROM golang:1.23.2-alpine AS builder
 
 ARG BLOCKY_VERSION=v0.25
@@ -41,6 +41,10 @@ ENV GOGC=100 \
     MAX_CLIENTS=131072 \
     MAX_CONCURRENT=256 \
     TRUST_PROXY=true
+
+# Give the platform a cheap readiness signal tied to the local Blocky listener.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD-SHELL wget -q -O /dev/null "http://127.0.0.1:${PORT:-8080}/healthz" || exit 1
 
 USER app:app
 ENTRYPOINT ["/entrypoint.sh"]

@@ -7,5 +7,5 @@ services:
       RATE_LIMIT: "99"
       MAX_CLIENTS: "131072"
       MAX_CONCURRENT: "256"
-      TRUST_PROXY: "false"
+      TRUST_PROXY: "true"
     restart: unless-stopped
