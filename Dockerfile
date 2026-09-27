@@ -36,7 +36,11 @@ RUN chmod 0555 /doh-gateway /blocky /entrypoint.sh && chmod 0444 /etc/blocky/con
 EXPOSE 8080
 
 # Small, memory-conscious process settings. The app reads PORT from SnapDeploy.
+# GOMAXPROCS is pinned to the tier's 0.25 vCPU quota; left unset, the Go
+# runtime sizes its scheduler/GC threads off the host's full core count
+# rather than the container's actual cgroup CPU quota.
 ENV GOGC=100 \
+    GOMAXPROCS=1 \
     RATE_LIMIT=99 \
     MAX_CLIENTS=131072 \
     MAX_CONCURRENT=256 \

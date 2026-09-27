@@ -62,12 +62,17 @@ This validation is primarily a resource-safety and protocol-correctness guard; i
 
 `TRUST_PROXY=true` is enabled because SnapDeploy routes traffic through its managed load balancer. The gateway uses the rightmost valid address in `X-Forwarded-For`, then `X-Real-IP`, and otherwise falls back to the TCP peer address. This matches the usual append-style proxy chain and avoids trusting a client-prepended spoofed address.
 
-For a direct local/container test without a trusted proxy, set `TRUST_PROXY=false`. Invalid `TRUST_PROXY` values fall back to the safe default (`false`).
+For a direct local/container test without a trusted proxy, set `TRUST_PROXY=false`. Invalid `TRUST_PROXY` values fall back to the safe default (`false`). `docker-compose.yml` already sets `TRUST_PROXY=false` for this reason; only the Dockerfile's production `ENV` defaults to `true`, since SnapDeploy's load balancer is the trusted proxy in that path.
+
+## Shutdown behavior
+
+On `SIGINT`/`SIGTERM`, the gateway stops accepting new connections and drains in-flight DoH requests via a graceful HTTP shutdown (up to 5 seconds) before exiting, rather than dropping active requests immediately. `entrypoint.sh` sends this signal to both processes and waits for them to exit.
 
 ## Resource tuning
 
 The default values are chosen for the Small tier:
 
+- `GOMAXPROCS=1` — matches the Go runtime's scheduler/GC thread count to the tier's 0.25 vCPU quota instead of the host's full core count.
 - `MAX_CONCURRENT=256` — bounds in-flight DNS work and prevents request floods from consuming all memory/CPU.
 - `MAX_CLIENTS=131072` — hard cap on in-memory rate-limit client states; the limiter map is allocated only when the first request arrives.
 - `caching.maxItemsCount=65536` — bounded Blocky cache; Blocky documents this option specifically as useful on systems with limited RAM.

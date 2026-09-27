@@ -12,9 +12,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -349,10 +351,8 @@ func validateDNSMessage(message []byte, response bool) error {
 	if qr != response {
 		return errors.New("unexpected dns QR flag")
 	}
-	if !response && uint16(message[4])<<8|uint16(message[5]) == 0 {
-		return errors.New("dns query has no question")
-	}
-
+	// A zero (or any non-1) question count is rejected by the qdCount != 1
+	// check below, so no separate "no question" check is needed here.
 	qdCount := int(uint16(message[4])<<8 | uint16(message[5]))
 	anCount := int(uint16(message[6])<<8 | uint16(message[7]))
 	nsCount := int(uint16(message[8])<<8 | uint16(message[9]))
@@ -584,7 +584,26 @@ func main() {
 	}
 
 	log.Printf("DoH gateway listening on %s; rate=%d requests/%s; maxClients=%d; maxConcurrent=%d; trustProxy=%t", port, rate, defaultWindow, maxClients, maxConcurrent, trustProxy)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(fmt.Errorf("listen: %w", err))
+
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- srv.ListenAndServe()
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(fmt.Errorf("listen: %w", err))
+		}
+	case sig := <-sigCh:
+		log.Printf("received %s; draining in-flight requests", sig)
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("graceful shutdown did not complete cleanly: %v", err)
+		}
 	}
 }
