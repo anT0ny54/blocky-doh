@@ -38,8 +38,11 @@ The `/dns-query` path is implemented by `doh-gateway`. Do not add `ports.dohPath
 1. Upload/connect this repository with the Dockerfile.
 2. Use the Small container size (512 MB / 0.25 vCPU).
 3. Do **not** create a `PORT` environment variable manually; SnapDeploy manages it. The image advertises port `8080`, so SnapDeploy can detect the service port.
-4. Add your custom domain if the service is intended for public DoH clients. SnapDeploy terminates HTTPS and routes to the container.
-5. Use `/dns-query` as the DoH path.
+4. No database, Redis, RabbitMQ, or other SnapDeploy add-on is required. Blocky's DNS response cache is in-memory and Blocky is otherwise stateless.
+5. Add your custom domain if the service is intended for public DoH clients. SnapDeploy terminates HTTPS and routes to the container.
+6. Use `/dns-query` as the DoH path.
+
+The Dockerfile intentionally does **not** run `git clone` or download Blocky source from GitHub during the build. It copies the Blocky v0.25 binary from the published `spx01/blocky:v0.25` image instead. This avoids the `git clone ... Failed to connect to github.com port 443` failure seen in restricted build environments.
 
 Example endpoint after a custom domain is attached:
 
@@ -64,7 +67,7 @@ This validation is primarily a resource-safety and protocol-correctness guard; i
 
 `TRUST_PROXY=true` is enabled because SnapDeploy routes traffic through its managed load balancer. The gateway uses the rightmost valid address in `X-Forwarded-For`, then `X-Real-IP`, and otherwise falls back to the TCP peer address. This matches the usual append-style proxy chain and avoids trusting a client-prepended spoofed address.
 
-For a direct local/container test without a trusted proxy, set `TRUST_PROXY=false`. Invalid `TRUST_PROXY` values fall back to the safe default (`false`). `docker-compose.yml` already sets `TRUST_PROXY=false` for this reason; only the Dockerfile's production `ENV` defaults to `true`, since SnapDeploy's load balancer is the trusted proxy in that path.
+For a direct local/container test without a trusted proxy, set `TRUST_PROXY=false`. Invalid `TRUST_PROXY` values fall back to the safe default (`false`). The Dockerfile's production `ENV` defaults to `true` because SnapDeploy's load balancer is the trusted proxy in that path.
 
 ## Shutdown behavior
 
@@ -98,8 +101,11 @@ Blocky uses the configured `bootstrapDns` IPs to reach the named HTTPS upstreams
 
 ## Local test
 
+Build and run the same single-container image locally:
+
 ```sh
-docker compose up --build
+docker build -t blocky-doh .
+docker run --rm -p 8080:8080 -e TRUST_PROXY=false blocky-doh
 ```
 
 The public container listener will be at `http://127.0.0.1:8080` locally. DoH clients should use `/dns-query` over HTTPS only when a valid TLS endpoint is in front of the container.

@@ -1,31 +1,30 @@
-# Builder: exact current supported Go toolchain for the DNS gateway and Blocky 0.25 build.
+# Use Blocky's published v0.25 image instead of cloning GitHub during the build.
+# This removes the build-time dependency on outbound access to github.com.
+FROM spx01/blocky:v0.25 AS blocky
+
+# Builder: exact Go toolchain for the small DNS gateway.
 FROM golang:1.23.2-alpine AS builder
 
-ARG BLOCKY_VERSION=v0.25
 ENV CGO_ENABLED=0 \
     GO111MODULE=on \
     GOTOOLCHAIN=local
-
-RUN apk add --no-cache ca-certificates git
 WORKDIR /src
 
-# Build the small DNS-only gateway.
+# The gateway only uses the Go standard library, so no source dependency
+# downloads are required during the build.
 COPY go.mod ./
 COPY main.go main_test.go ./
 RUN go test ./...
 RUN go build -trimpath -ldflags='-s -w' -o /out/doh-gateway .
 
-# Blocky v0.25 uses a Git tag named v0.25 (not a Go-semver v0.25.0 module version).
-# Clone that exact tag, then build it from source.
-RUN git clone --depth 1 --branch "${BLOCKY_VERSION}" --single-branch https://github.com/0xERR0R/blocky.git /tmp/blocky && \
-    cd /tmp/blocky && \
-    go build -trimpath -ldflags='-s -w' -o /out/blocky . && \
-    rm -rf /tmp/blocky
+# Blocky is copied from the published multi-arch image above; no source checkout is needed.
+COPY --from=blocky /app/blocky /out/blocky
 
 # Final runtime: Alpine 3.24, no Go toolchain kept in the image.
 FROM alpine:3.24
 
-RUN apk add --no-cache ca-certificates && \
+# wget is used by the health check; ca-certificates are needed for HTTPS upstreams.
+RUN apk add --no-cache ca-certificates wget && \
     addgroup -S app && adduser -S -G app -H app && \
     mkdir -p /etc/blocky && chown -R app:app /etc/blocky
 
@@ -40,9 +39,7 @@ RUN chmod 0555 /doh-gateway /blocky /entrypoint.sh && chmod 0444 /etc/blocky/con
 EXPOSE 8080
 
 # Small, memory-conscious process settings. The app reads PORT from SnapDeploy.
-# GOMAXPROCS is pinned to the tier's 0.25 vCPU quota; left unset, the Go
-# runtime sizes its scheduler/GC threads off the host's full core count
-# rather than the container's actual cgroup CPU quota.
+# GOMAXPROCS is pinned to the tier's 0.25 vCPU quota.
 ENV GOGC=100 \
     GOMAXPROCS=1 \
     RATE_LIMIT=99 \
@@ -50,7 +47,7 @@ ENV GOGC=100 \
     MAX_CONCURRENT=256 \
     TRUST_PROXY=true
 
-# Give the platform a cheap readiness signal tied to the local Blocky listener.
+# Readiness is tied to the local Blocky-backed gateway.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget -q -O /dev/null "http://127.0.0.1:${PORT:-8080}/healthz" || exit 1
 
