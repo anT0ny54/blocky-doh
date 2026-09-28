@@ -35,8 +35,8 @@ const (
 	defaultBackendAddr    = "127.0.0.1:8053"
 	defaultRate           = 99
 	defaultWindow         = 60 * time.Second
-	defaultMaxClients     = 131072
-	defaultMaxConcurrent  = 256
+	defaultMaxClients     = 64
+	defaultMaxConcurrent  = 128
 	maxDNSBody            = 65535
 	maxDNSResourceRecords = 4096
 	clientIdleTTL         = 2 * time.Minute

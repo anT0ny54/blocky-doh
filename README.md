@@ -19,7 +19,7 @@ Internet / SnapDeploy HTTPS
   doh-gateway :$PORT
      |       |
      |       +-- per-client-IP limiter: 99 / 60s
-     |       +-- max concurrent DNS requests: 256
+     |       +-- max concurrent DNS requests: 128
      |       +-- DNS wire-format validation
      |
      v
@@ -78,8 +78,8 @@ On `SIGINT`/`SIGTERM`, the gateway stops accepting new connections and drains in
 The default values are chosen for the Small tier:
 
 - `GOMAXPROCS=1` — matches the Go runtime's scheduler/GC thread count to the tier's 0.25 vCPU quota instead of the host's full core count.
-- `MAX_CONCURRENT=256` — bounds in-flight DNS work and prevents request floods from consuming all memory/CPU.
-- `MAX_CLIENTS=131072` — hard cap on in-memory rate-limit client states; the limiter map is allocated only when the first request arrives.
+- `MAX_CONCURRENT=128` — bounds in-flight DNS work and prevents request floods from consuming all memory/CPU.
+- `MAX_CLIENTS=64` — hard cap on in-memory rate-limit client states; the limiter map is allocated only when the first request arrives.
 - `caching.maxItemsCount=65536` — bounded Blocky cache; Blocky documents this option specifically as useful on systems with limited RAM.
 - `upstreams.strategy=random` — one upstream request per cache miss in the normal path; this avoids the extra upstream fan-out of `parallel_best` and is a better fit for 0.25 vCPU.
 - `upstreams.timeout=1200ms` — keeps each failed upstream attempt below the gateway's 3-second request deadline and leaves room for fallback.

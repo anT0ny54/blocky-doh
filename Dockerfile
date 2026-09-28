@@ -43,8 +43,8 @@ EXPOSE 8080
 ENV GOGC=100 \
     GOMAXPROCS=1 \
     RATE_LIMIT=99 \
-    MAX_CLIENTS=131072 \
-    MAX_CONCURRENT=256 \
+    MAX_CLIENTS=64 \
+    MAX_CONCURRENT=128 \
     TRUST_PROXY=true
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
