@@ -1,5 +1,5 @@
 # Builder: exact Go toolchain + Blocky binary source
-FROM golang:1.23.2-alpine AS builder
+FROM golang:1.27.1-alpine AS builder
 
 ENV CGO_ENABLED=0 \
     GO111MODULE=on \
@@ -16,8 +16,9 @@ RUN go vet ./... && \
     go test ./... && \
     go build -trimpath -ldflags='-s -w' -o /out/doh-gateway .
 
-# Pull the published Blocky binary directly from its image.
-COPY --from=spx01/blocky:v0.25 /app/blocky /out/blocky
+# Pull the official latest stable Blocky release directly from its published image.
+# v0.35.0 is the current latest stable release as of 2026-09-29.
+COPY --from=ghcr.io/0xerr0r/blocky:v0.35.0 /app/blocky /out/blocky
 
 
 # Final runtime: no Go toolchain kept in the image.
@@ -44,8 +45,8 @@ EXPOSE 8080
 # default; MAX_CLIENTS/MAX_CONCURRENT/RATE_LIMIT mirror the gateway defaults.
 ENV GOMAXPROCS=1 \
     RATE_LIMIT=99 \
-    MAX_CLIENTS=64 \
-    MAX_CONCURRENT=128 \
+    MAX_CLIENTS=256 \
+    MAX_CONCURRENT=16 \
     TRUST_PROXY=true
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \

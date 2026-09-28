@@ -34,8 +34,11 @@ const (
 	defaultBackendAddr    = "127.0.0.1:8053"
 	defaultRate           = 99
 	defaultWindow         = 60 * time.Second
-	defaultMaxClients     = 64
-	defaultMaxConcurrent  = 128
+	defaultMaxClients     = 256
+	defaultMaxConcurrent  = 16
+	maxRateLimit          = 256
+	maxLimiterClients     = 1024
+	maxConcurrentLimit    = 16
 	maxDNSBody            = 65535
 	maxDNSResourceRecords = 4096
 	clientIdleTTL         = 2 * time.Minute
@@ -192,13 +195,13 @@ type server struct {
 	trustProxy  bool
 }
 
-func parseEnvInt(name string, def int) int {
+func parseEnvInt(name string, def, max int) int {
 	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
 		return def
 	}
 	n, err := strconv.Atoi(value)
-	if err != nil || n < 1 {
+	if err != nil || n < 1 || n > max {
 		return def
 	}
 	return n
@@ -435,6 +438,28 @@ func expandDNSName(message []byte, offset int) (string, int, error) {
 // dnsQuestionEqual reports whether the question sections of query and
 // response carry the same owner name (compression-expanded) and QTYPE/QCLASS,
 // so a confused upstream cannot swap answers between different questions.
+func dnsNameEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		x, y := a[i], b[i]
+		if x >= 'A' && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if y >= 'A' && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
+}
+
+// dnsQuestionEqual reports whether the question sections of query and
+// response carry the same owner name (compression-expanded) and QTYPE/QCLASS,
+// so a confused upstream cannot swap answers between different questions.
 func dnsQuestionEqual(query, response []byte) bool {
 	qName, qEnd, err := expandDNSName(query, 12)
 	if err != nil {
@@ -444,7 +469,7 @@ func dnsQuestionEqual(query, response []byte) bool {
 	if err != nil {
 		return false
 	}
-	if qName != rName || qEnd+4 > len(query) || rEnd+4 > len(response) {
+	if !dnsNameEqual(qName, rName) || qEnd+4 > len(query) || rEnd+4 > len(response) {
 		return false
 	}
 	return bytes.Equal(query[qEnd:qEnd+4], response[rEnd:rEnd+4])
@@ -656,9 +681,9 @@ func main() {
 		port = ":" + port
 	}
 
-	rate := parseEnvInt("RATE_LIMIT", defaultRate)
-	maxClients := parseEnvInt("MAX_CLIENTS", defaultMaxClients)
-	maxConcurrent := parseEnvInt("MAX_CONCURRENT", defaultMaxConcurrent)
+	rate := parseEnvInt("RATE_LIMIT", defaultRate, maxRateLimit)
+	maxClients := parseEnvInt("MAX_CLIENTS", defaultMaxClients, maxLimiterClients)
+	maxConcurrent := parseEnvInt("MAX_CONCURRENT", defaultMaxConcurrent, maxConcurrentLimit)
 	trustProxy := parseEnvBool("TRUST_PROXY", false)
 	lim := newLimiter(rate, defaultWindow, maxClients)
 
@@ -668,10 +693,10 @@ func main() {
 
 	transport := &http.Transport{
 		Proxy:                  nil,
-		MaxIdleConns:           64,
-		MaxIdleConnsPerHost:    64,
+		MaxIdleConns:           16,
+		MaxIdleConnsPerHost:    16,
 		MaxConnsPerHost:        maxConcurrent,
-		IdleConnTimeout:        60 * time.Second,
+		IdleConnTimeout:        30 * time.Second,
 		DisableCompression:     true,
 		ResponseHeaderTimeout:  2500 * time.Millisecond,
 		MaxResponseHeaderBytes: maxHeaderBytes,

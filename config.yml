@@ -1,4 +1,4 @@
-# Minimal Blocky 0.25 configuration for a public DoH service.
+# Minimal Blocky v0.35.0 configuration for a public DoH service.
 # The public listener is the Go DNS-only gateway; Blocky stays private on loopback.
 
 connectIPVersion: v4
@@ -32,12 +32,12 @@ upstreams:
 
 ports:
   # Blocky is intentionally reachable only by the local DoH gateway.
-  # DoH is handled at /dns-query by the gateway; Blocky v0.25 has no ports.dohPath option.
+  # Blocky's DoH is available only on loopback; the gateway exposes the public /dns-query path.
   http: 127.0.0.1:8053
 
 # Keep memory predictable on the 512 MB tier.
 caching:
-  maxItemsCount: 65536
+  maxItemsCount: 32768
   prefetching: false
   cacheTimeNegative: 5m
 

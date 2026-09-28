@@ -3,8 +3,8 @@
 Minimal public DNS-over-HTTPS service using:
 
 - Alpine Linux 3.24 runtime
-- Go 1.23.2 build toolchain
-- Blocky v0.25
+- Go 1.27.1 build toolchain
+- Blocky v0.35.0
 - HaGeZi DoH upstreams
 - DNS-only Go HTTP gateway for the exact **99 requests / 60 seconds / client IP** rule
 - Public listener on `$PORT` (local default: `8080`)
@@ -19,21 +19,21 @@ Internet / SnapDeploy HTTPS
   doh-gateway :$PORT
      |       |
      |       +-- per-client-IP limiter: 99 / 60s strict sliding window
-     |       +-- max concurrent DNS requests: 128
+     |       +-- max concurrent DNS requests: 16
      |       +-- DNS wire-format validation
      |
      v
- Blocky 0.25
+ Blocky 0.35.0
  127.0.0.1:8053
      |
      +-- HTTPS to HaGeZi DoH upstreams
 ```
 
-Blocky 0.25 does not provide the newer `rateLimit` configuration, so the rate limiter is deliberately kept outside Blocky while the DNS engine remains exactly v0.25.
+The exact **99 requests / 60 seconds / client IP** policy is deliberately kept in the gateway rather than delegated to Blocky, so the policy remains independent of Blocky release changes.
 
 The limiter is a **strict sliding window**: at most 99 requests per client IP fall inside any rolling 60-second span. There is no token refill — after a full 99-request burst, further requests are admitted only as earlier timestamps age out of the window. Two rejection modes are distinguished: an over-budget client receives `429`, while a new client arriving when the fixed client table is full receives `503`, so capacity exhaustion is not mistaken for per-client throttling. Client identities are normalized with `net.IP.String()`, so an IPv6 client cannot occupy multiple limiter states via alternate textual encodings of the same address.
 
-The `/dns-query` path is implemented by `doh-gateway`. Do not add `ports.dohPath` to this Blocky 0.25 configuration; that field is not part of the v0.25 `ports` schema.
+The `/dns-query` path is implemented by `doh-gateway`. Blocky v0.35.0 supports DoH itself, but this project intentionally keeps Blocky's public-facing listeners disabled and serves `/dns-query` through the resource-bounded gateway instead.
 
 ## SnapDeploy deployment
 
@@ -44,7 +44,7 @@ The `/dns-query` path is implemented by `doh-gateway`. Do not add `ports.dohPath
 5. Add your custom domain if the service is intended for public DoH clients. SnapDeploy terminates HTTPS and routes to the container.
 6. Use `/dns-query` as the DoH path.
 
-The Dockerfile intentionally does **not** run `git clone` or download Blocky source from GitHub during the build. It copies the Blocky v0.25 binary from the published `spx01/blocky:v0.25` image instead. This avoids the `git clone ... Failed to connect to github.com port 443` failure seen in restricted build environments.
+The Dockerfile intentionally does **not** run `git clone` or download Blocky source from GitHub during the build. It copies the Blocky v0.35.0 binary from the official `ghcr.io/0xerr0r/blocky:v0.35.0` image instead. This avoids the `git clone ... Failed to connect to github.com port 443` failure seen in restricted build environments.
 
 Example endpoint after a custom domain is attached:
 
@@ -80,9 +80,9 @@ On `SIGINT`/`SIGTERM`, the gateway stops accepting new connections and drains in
 The default values are chosen for the Small tier:
 
 - `GOMAXPROCS=1` — matches the Go runtime's scheduler/GC thread count to the tier's 0.25 vCPU quota instead of the host's full core count.
-- `MAX_CONCURRENT=128` — bounds in-flight DNS work and prevents request floods from consuming all memory/CPU.
-- `MAX_CLIENTS=64` — hard cap on in-memory rate-limit client states; the limiter map is allocated only when the first request arrives. Values below 1 fall back to the default. When the table is full, new clients receive `503` and the event is logged, while over-budget clients receive `429`.
-- `caching.maxItemsCount=65536` — bounded Blocky cache; Blocky documents this option specifically as useful on systems with limited RAM.
+- `MAX_CONCURRENT=16` — bounds in-flight DNS work and prevents request floods from consuming all memory/CPU.
+- `MAX_CLIENTS=256` — hard cap on in-memory rate-limit client states; the limiter map is allocated only when the first request arrives. Values below 1 fall back to the default. When the table is full, new clients receive `503` and the event is logged, while over-budget clients receive `429`.
+- `caching.maxItemsCount=32768` — bounded Blocky cache; Blocky documents this option specifically as useful on systems with limited RAM.
 - `upstreams.strategy=random` — one upstream request per cache miss in the normal path; this avoids the extra upstream fan-out of `parallel_best` and is a better fit for 0.25 vCPU.
 - `upstreams.timeout=1200ms` — keeps each failed upstream attempt below the gateway's 3-second request deadline and leaves room for fallback.
 - Backend HTTP response headers are capped at 16 KiB and redirects are disabled to keep the loopback-only backend path bounded and non-redirecting.

@@ -344,6 +344,22 @@ func TestDNSQuestionEqual(t *testing.T) {
 	}
 }
 
+func TestDNSQuestionEqualIsCaseInsensitive(t *testing.T) {
+	query := testDNSQuery(0x71)
+	response := testDNSResponse(query)
+	// The DNS protocol treats ASCII letters in domain names case-insensitively.
+	response[13] = 'E'
+	response[14] = 'X'
+	response[15] = 'A'
+	response[16] = 'M'
+	response[17] = 'P'
+	response[18] = 'L'
+	response[19] = 'E'
+	if !dnsQuestionEqual(query, response) {
+		t.Fatal("case-only DNS question difference was rejected")
+	}
+}
+
 func TestDoHPOSTForwardsValidatedWireMessage(t *testing.T) {
 	query := testDNSQuery(0x21)
 	response := testDNSResponse(query)
@@ -790,6 +806,31 @@ func TestClientIPDoesNotTrustForwardedHeadersWhenDisabled(t *testing.T) {
 	req.Header.Set("X-Forwarded-For", "203.0.113.9")
 	if got := clientIP(req, false); got != "192.0.2.10" {
 		t.Fatalf("clientIP=%q; want remote peer address", got)
+	}
+}
+
+func TestParseEnvIntRejectsUnsafeValues(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+		def   int
+		max   int
+		want  int
+	}{
+		{"valid", "12", 99, 256, 12},
+		{"empty", "", 99, 256, 99},
+		{"invalid", "abc", 99, 256, 99},
+		{"zero", "0", 99, 256, 99},
+		{"negative", "-1", 99, 256, 99},
+		{"above cap", "257", 99, 256, 99},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TEST_INT", tc.value)
+			if got := parseEnvInt("TEST_INT", tc.def, tc.max); got != tc.want {
+				t.Fatalf("parseEnvInt(%q, %d, %d)=%d; want %d", tc.value, tc.def, tc.max, got, tc.want)
+			}
+		})
 	}
 }
 

@@ -1,3 +1,3 @@
 module github.com/anT0ny54/blocky-doh
 
-go 1.23
+go 1.27
