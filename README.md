@@ -31,6 +31,8 @@ Internet / SnapDeploy HTTPS
 
 Blocky 0.25 does not provide the newer `rateLimit` configuration, so the rate limiter is deliberately kept outside Blocky while the DNS engine remains exactly v0.25.
 
+The `/dns-query` path is implemented by `doh-gateway`. Do not add `ports.dohPath` to this Blocky 0.25 configuration; that field is not part of the v0.25 `ports` schema.
+
 ## SnapDeploy deployment
 
 1. Upload/connect this repository with the Dockerfile.

@@ -29,9 +29,8 @@ upstreams:
       - https://juuri.hagezi.org/dns-query
 
 ports:
-  dns:
-  tls:
-  https:
+  # Blocky is intentionally reachable only by the local DoH gateway.
+  # DoH is handled at /dns-query by the gateway; Blocky v0.25 has no ports.dohPath option.
   http: 127.0.0.1:8053
 
 # Keep memory predictable on the 512 MB tier.
