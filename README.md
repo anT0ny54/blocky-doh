@@ -18,7 +18,7 @@ Internet / SnapDeploy HTTPS
           v
   doh-gateway :$PORT
      |       |
-     |       +-- per-client-IP limiter: 99 / 60s
+     |       +-- per-client-IP limiter: 99 / 60s strict sliding window
      |       +-- max concurrent DNS requests: 128
      |       +-- DNS wire-format validation
      |
@@ -30,6 +30,8 @@ Internet / SnapDeploy HTTPS
 ```
 
 Blocky 0.25 does not provide the newer `rateLimit` configuration, so the rate limiter is deliberately kept outside Blocky while the DNS engine remains exactly v0.25.
+
+The limiter is a **strict sliding window**: at most 99 requests per client IP fall inside any rolling 60-second span. There is no token refill — after a full 99-request burst, further requests are admitted only as earlier timestamps age out of the window. Two rejection modes are distinguished: an over-budget client receives `429`, while a new client arriving when the fixed client table is full receives `503`, so capacity exhaustion is not mistaken for per-client throttling. Client identities are normalized with `net.IP.String()`, so an IPv6 client cannot occupy multiple limiter states via alternate textual encodings of the same address.
 
 The `/dns-query` path is implemented by `doh-gateway`. Do not add `ports.dohPath` to this Blocky 0.25 configuration; that field is not part of the v0.25 `ports` schema.
 
@@ -57,7 +59,7 @@ The gateway accepts RFC-style DoH GET and POST requests on `/dns-query`:
 - GET `dns=` values are decoded as unpadded base64url and forwarded internally as bounded POST requests.
 - POST requests require `application/dns-message` and are capped at the 65,535-byte DNS wire-format maximum.
 - Incoming DNS messages are structurally validated before Blocky is called; exactly one DNS question is required and resource records are capped at 4,096.
-- Upstream responses must be HTTP `200`, use `application/dns-message`, fit the same size bound, have valid DNS wire structure, and preserve the request transaction ID.
+- Upstream responses must be HTTP `200`, use `application/dns-message`, fit the same size bound, have valid DNS wire structure, preserve the request transaction ID, and echo the request's question section (owner name and QTYPE/QCLASS, compression-expanded).
 - Backend response headers are capped at 16 KiB, response bodies at 65,535 bytes, and backend redirects are never followed.
 - The gateway never forwards arbitrary upstream response headers to clients.
 
@@ -79,13 +81,14 @@ The default values are chosen for the Small tier:
 
 - `GOMAXPROCS=1` — matches the Go runtime's scheduler/GC thread count to the tier's 0.25 vCPU quota instead of the host's full core count.
 - `MAX_CONCURRENT=128` — bounds in-flight DNS work and prevents request floods from consuming all memory/CPU.
-- `MAX_CLIENTS=64` — hard cap on in-memory rate-limit client states; the limiter map is allocated only when the first request arrives.
+- `MAX_CLIENTS=64` — hard cap on in-memory rate-limit client states; the limiter map is allocated only when the first request arrives. Values below 1 fall back to the default. When the table is full, new clients receive `503` and the event is logged, while over-budget clients receive `429`.
 - `caching.maxItemsCount=65536` — bounded Blocky cache; Blocky documents this option specifically as useful on systems with limited RAM.
 - `upstreams.strategy=random` — one upstream request per cache miss in the normal path; this avoids the extra upstream fan-out of `parallel_best` and is a better fit for 0.25 vCPU.
 - `upstreams.timeout=1200ms` — keeps each failed upstream attempt below the gateway's 3-second request deadline and leaves room for fallback.
 - Backend HTTP response headers are capped at 16 KiB and redirects are disabled to keep the loopback-only backend path bounded and non-redirecting.
 - `connectIPVersion=v4` — avoids unnecessary IPv6 connection attempts for the supplied upstream configuration.
 - Query logging, statistics, Prometheus, API, prefetching, and blocklists are disabled.
+- Gateway observability is limited to startup, upstream failure (`502`/`504`), and rate-limiter capacity messages on stdout, so request floods cannot turn logging into a resource drain.
 
 These are capacity-oriented defaults, not a guarantee of a fixed users-per-second number. Real capacity depends heavily on cache hit rate, DNS response sizes, upstream latency, and the traffic pattern.
 
@@ -107,6 +110,8 @@ Build and run the same single-container image locally:
 docker build -t blocky-doh .
 docker run --rm -p 8080:8080 -e TRUST_PROXY=false blocky-doh
 ```
+
+`docker-compose.yml` pins `TRUST_PROXY=false` for the same reason: a plain local compose setup has no trusted load balancer in front, so forwarded headers must be ignored.
 
 The public container listener will be at `http://127.0.0.1:8080` locally. DoH clients should use `/dns-query` over HTTPS only when a valid TLS endpoint is in front of the container.
 

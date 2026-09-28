@@ -3,9 +3,10 @@ services:
     build: .
     ports:
       - "8080:8080"
+    # Local compose runs without a trusted reverse proxy in front: spoofable
+    # X-Forwarded-For headers must be ignored, so per-client rate limiting
+    # stays keyed on the real peer address. (The production image defaults to
+    # TRUST_PROXY=true because SnapDeploy's load balancer is the trusted proxy.)
     environment:
-      RATE_LIMIT: "99"
-      MAX_CLIENTS: "64"
-      MAX_CONCURRENT: "128"
       TRUST_PROXY: "true"
     restart: unless-stopped

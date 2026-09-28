@@ -1,12 +1,14 @@
 # Minimal Blocky 0.25 configuration for a public DoH service.
 # The public listener is the Go DNS-only gateway; Blocky stays private on loopback.
 
-minTlsServeVersion: 1.2
 connectIPVersion: v4
 
 # Prevent bootstrap lookups for the DoH upstream hostnames from falling back to
 # the container's general-purpose resolver. The IPs are used only to reach the
 # named HTTPS endpoints; TLS still uses the configured hostnames/SNI.
+#
+# NOTE: keep this list in sync with upstreams.groups.default below. Each named
+# HTTPS upstream needs a bootstrap entry with its fixed IP.
 bootstrapDns:
   - upstream: https://root.hagezi.org/dns-query
     ips:

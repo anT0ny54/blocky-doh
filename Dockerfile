@@ -12,7 +12,8 @@ COPY go.mod ./
 COPY main.go main_test.go ./
 
 # Standard-library-only gateway: no dependency downloads required.
-RUN go test ./... && \
+RUN go vet ./... && \
+    go test ./... && \
     go build -trimpath -ldflags='-s -w' -o /out/doh-gateway .
 
 # Pull the published Blocky binary directly from its image.
@@ -39,9 +40,9 @@ RUN chmod 0555 /doh-gateway /blocky /entrypoint.sh && \
 
 EXPOSE 8080
 
-# Small, memory-conscious process settings.
-ENV GOGC=100 \
-    GOMAXPROCS=1 \
+# Small, memory-conscious process settings. GOGC intentionally left at the Go
+# default; MAX_CLIENTS/MAX_CONCURRENT/RATE_LIMIT mirror the gateway defaults.
+ENV GOMAXPROCS=1 \
     RATE_LIMIT=99 \
     MAX_CLIENTS=64 \
     MAX_CONCURRENT=128 \

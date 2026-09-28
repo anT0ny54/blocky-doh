@@ -26,7 +26,6 @@ var (
 	errDNSMessageTooLarge  = errors.New("dns message too large")
 	errInvalidContentType  = errors.New("invalid content type")
 	errFailedReadDNSBody   = errors.New("failed to read dns message")
-	errUnsupportedMethod   = errors.New("unsupported method")
 )
 
 const (
@@ -41,21 +40,35 @@ const (
 	maxDNSResourceRecords = 4096
 	clientIdleTTL         = 2 * time.Minute
 	maxDNSNameHops        = 255
+	maxDNSNameLength      = 255
 	maxHeaderBytes        = 16 << 10
 )
 
+// limitResult distinguishes an admitted request from the two rejection modes:
+// the client exceeded its per-window rate budget, or the client table itself
+// is full and no state can be admitted.
+type limitResult int
+
+const (
+	limitAllowed limitResult = iota
+	limitRateLimited
+	limitCapacity
+)
+
+// clientState tracks one client's request timestamps inside the sliding
+// rate-limit window. The slice holds at most l.rate entries.
 type clientState struct {
-	mu   sync.Mutex
-	tat  time.Time
-	seen time.Time
+	mu    sync.Mutex
+	times []time.Time
+	seen  time.Time
 }
 
 type limiter struct {
 	mu         sync.Mutex
 	clients    map[string]*clientState
 	maxClients int
-	interval   time.Duration // spacing between allowed requests
-	burstTol   time.Duration // tolerance allowing the initial burst
+	rate       int
+	window     time.Duration
 }
 
 func newLimiter(rate int, window time.Duration, maxClients int) *limiter {
@@ -65,18 +78,22 @@ func newLimiter(rate int, window time.Duration, maxClients int) *limiter {
 	if window <= 0 {
 		window = defaultWindow
 	}
-	if maxClients < 1024 {
+	if maxClients < 1 {
 		maxClients = defaultMaxClients
 	}
-	interval := window / time.Duration(rate)
 	return &limiter{
 		maxClients: maxClients,
-		interval:   interval,
-		burstTol:   interval * time.Duration(rate-1),
+		rate:       rate,
+		window:     window,
 	}
 }
 
-func (l *limiter) allow(ip string, now time.Time) bool {
+// check admits ip if fewer than l.rate of its requests fall inside the
+// sliding window (now-l.window, now]. It returns limitCapacity when the
+// client table is full and no idle state can be evicted.
+func (l *limiter) check(ip string, now time.Time) limitResult {
+	cutoff := now.Add(-l.window)
+
 	l.mu.Lock()
 	if l.clients == nil {
 		l.clients = make(map[string]*clientState)
@@ -91,7 +108,7 @@ func (l *limiter) allow(ip string, now time.Time) bool {
 			// Preserving the existing state keeps the per-client limit intact
 			// and avoids splitting one client's rate history across two states.
 			l.mu.Unlock()
-			return false
+			return limitCapacity
 		}
 		state = &clientState{}
 		l.clients[ip] = state
@@ -102,19 +119,27 @@ func (l *limiter) allow(ip string, now time.Time) bool {
 	state.mu.Lock()
 	l.mu.Unlock()
 
-	state.seen = now
-	threshold := state.tat.Add(-l.burstTol)
-	if state.tat.IsZero() || !now.Before(threshold) {
-		base := state.tat
-		if now.After(base) {
-			base = now
+	// Drop timestamps that fell outside the sliding window, then admit the
+	// request only if fewer than l.rate requests remain inside it. Only
+	// admitted requests refresh liveness: an over-budget client still has
+	// recent admitted traffic, while rejected requests must not keep a state
+	// alive forever and starve the fixed-size client table.
+	kept := state.times[:0]
+	for _, t := range state.times {
+		if t.After(cutoff) {
+			kept = append(kept, t)
 		}
-		state.tat = base.Add(l.interval)
-		state.mu.Unlock()
-		return true
 	}
+	state.times = kept
+
+	if len(state.times) >= l.rate {
+		state.mu.Unlock()
+		return limitRateLimited
+	}
+	state.times = append(state.times, now)
+	state.seen = now
 	state.mu.Unlock()
-	return false
+	return limitAllowed
 }
 
 func (l *limiter) evictSomeLocked(now time.Time) {
@@ -194,26 +219,33 @@ func parseEnvBool(name string, def bool) bool {
 	}
 }
 
+// clientIP resolves the rate-limit client identity. With trustProxy, the
+// rightmost parseable X-Forwarded-For entry wins, then X-Real-IP, then the
+// TCP peer. Every returned address is normalized via net.IP.String so that
+// IPv6 clients cannot occupy several limiter states through alternate
+// textual encodings of the same address.
 func clientIP(r *http.Request, trustProxy bool) string {
 	if trustProxy {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			parts := strings.Split(xff, ",")
 			for i := len(parts) - 1; i >= 0; i-- {
-				candidate := strings.TrimSpace(parts[i])
-				if net.ParseIP(candidate) != nil {
-					return candidate
+				if ip := net.ParseIP(strings.TrimSpace(parts[i])); ip != nil {
+					return ip.String()
 				}
 			}
 		}
 		if rip := strings.TrimSpace(r.Header.Get("X-Real-IP")); net.ParseIP(rip) != nil {
-			return rip
+			return net.ParseIP(rip).String()
 		}
 	}
-	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
-	if err == nil && net.ParseIP(host) != nil {
-		return host
+	host := strings.TrimSpace(r.RemoteAddr)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
 	}
-	return strings.TrimSpace(r.RemoteAddr)
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+		return ip.String()
+	}
+	return host
 }
 
 func (s *server) health(w http.ResponseWriter, r *http.Request) {
@@ -243,6 +275,8 @@ func writeGatewayError(w http.ResponseWriter, code int, msg string) {
 	http.Error(w, msg, code)
 }
 
+// decodeDoHQuery extracts the DNS wire message from a DoH request. The caller
+// must already have restricted r.Method to GET or POST.
 func decodeDoHQuery(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	if r.Method == http.MethodGet {
 		encoded := r.URL.Query().Get("dns")
@@ -257,10 +291,6 @@ func decodeDoHQuery(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 			return nil, errDNSMessageTooLarge
 		}
 		return decoded, nil
-	}
-
-	if r.Method != http.MethodPost {
-		return nil, errUnsupportedMethod
 	}
 
 	if !validContentType(r.Header.Get("Content-Type")) {
@@ -316,7 +346,7 @@ func skipDNSName(message []byte, offset int) (int, error) {
 			pos++
 			if length == 0 {
 				nameLen++
-				if nameLen > 255 {
+				if nameLen > maxDNSNameLength {
 					return 0, errors.New("dns name too long")
 				}
 				if jumped {
@@ -331,7 +361,7 @@ func skipDNSName(message []byte, offset int) (int, error) {
 				return 0, errors.New("truncated dns label")
 			}
 			nameLen += 1 + length
-			if nameLen > 255 {
+			if nameLen > maxDNSNameLength {
 				return 0, errors.New("dns name too long")
 			}
 			pos += length
@@ -339,6 +369,85 @@ func skipDNSName(message []byte, offset int) (int, error) {
 			return 0, errors.New("invalid dns label type")
 		}
 	}
+}
+
+// expandDNSName walks a possibly compressed DNS name starting at offset and
+// returns its canonical dot-separated text form together with the offset of
+// the first byte after the name in message (the position following the
+// pointer when compression was used).
+func expandDNSName(message []byte, offset int) (string, int, error) {
+	var b strings.Builder
+	pos := offset
+	end := -1
+	jumped := false
+	hops := 0
+	for {
+		if pos >= len(message) {
+			return "", 0, errors.New("truncated dns name")
+		}
+		length := int(message[pos])
+		switch length & 0xc0 {
+		case 0xc0:
+			if pos+1 >= len(message) {
+				return "", 0, errors.New("truncated dns compression pointer")
+			}
+			pointer := ((length & 0x3f) << 8) | int(message[pos+1])
+			if pointer < 12 || pointer >= len(message) || pointer >= pos {
+				return "", 0, errors.New("invalid dns compression pointer")
+			}
+			if !jumped {
+				end = pos + 2
+				jumped = true
+			}
+			hops++
+			if hops > maxDNSNameHops {
+				return "", 0, errors.New("dns compression pointer loop")
+			}
+			pos = pointer
+		case 0x00:
+			pos++
+			if length == 0 {
+				if !jumped {
+					end = pos
+				}
+				return b.String(), end, nil
+			}
+			if length > 63 {
+				return "", 0, errors.New("dns label too long")
+			}
+			if pos+length > len(message) {
+				return "", 0, errors.New("truncated dns label")
+			}
+			if b.Len()+length > maxDNSNameLength {
+				return "", 0, errors.New("dns name too long")
+			}
+			if b.Len() > 0 {
+				b.WriteByte('.')
+			}
+			b.Write(message[pos : pos+length])
+			pos += length
+		default:
+			return "", 0, errors.New("invalid dns label type")
+		}
+	}
+}
+
+// dnsQuestionEqual reports whether the question sections of query and
+// response carry the same owner name (compression-expanded) and QTYPE/QCLASS,
+// so a confused upstream cannot swap answers between different questions.
+func dnsQuestionEqual(query, response []byte) bool {
+	qName, qEnd, err := expandDNSName(query, 12)
+	if err != nil {
+		return false
+	}
+	rName, rEnd, err := expandDNSName(response, 12)
+	if err != nil {
+		return false
+	}
+	if qName != rName || qEnd+4 > len(query) || rEnd+4 > len(response) {
+		return false
+	}
+	return bytes.Equal(query[qEnd:qEnd+4], response[rEnd:rEnd+4])
 }
 
 func validateDNSMessage(message []byte, response bool) error {
@@ -416,11 +525,6 @@ func validContentType(value string) bool {
 }
 
 func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/dns-query" {
-		writeGatewayError(w, http.StatusNotFound, "not found")
-		return
-	}
-
 	if r.Method == http.MethodOptions {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -434,23 +538,20 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.limiter.allow(clientIP(r, s.trustProxy), time.Now()) {
+	switch s.limiter.check(clientIP(r, s.trustProxy), time.Now()) {
+	case limitAllowed:
+	case limitRateLimited:
 		w.Header().Set("Retry-After", "1")
 		writeGatewayError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
-	}
-
-	select {
-	case s.concurrent <- struct{}{}:
-		defer func() { <-s.concurrent }()
-	default:
+	default: // limitCapacity
+		log.Printf("client limiter at capacity (%d states); rejecting new client", s.limiter.maxClients)
 		writeGatewayError(w, http.StatusServiceUnavailable, "server busy")
 		return
 	}
 
 	query, err := decodeDoHQuery(w, r)
 	if err != nil {
-		code := http.StatusBadRequest
 		if errors.Is(err, errInvalidContentType) {
 			writeGatewayError(w, http.StatusUnsupportedMediaType, "content-type must be application/dns-message")
 			return
@@ -459,12 +560,22 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 			writeGatewayError(w, http.StatusRequestEntityTooLarge, "dns message too large")
 			return
 		}
-		writeGatewayError(w, code, err.Error())
+		writeGatewayError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	if err := validateDNSMessage(query, false); err != nil {
 		writeGatewayError(w, http.StatusBadRequest, "invalid dns message")
+		return
+	}
+
+	// Acquire the concurrency slot only after the body has been read and
+	// validated so slow or malformed uploads cannot occupy slots.
+	select {
+	case s.concurrent <- struct{}{}:
+		defer func() { <-s.concurrent }()
+	default:
+		writeGatewayError(w, http.StatusServiceUnavailable, "server busy")
 		return
 	}
 
@@ -487,6 +598,7 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, context.DeadlineExceeded) {
 			status = http.StatusGatewayTimeout
 		}
+		log.Printf("upstream DNS request failed: %v", err)
 		writeGatewayError(w, status, "upstream DNS service unavailable")
 		return
 	}
@@ -513,12 +625,26 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, http.StatusBadGateway, "upstream DNS transaction ID mismatch")
 		return
 	}
+	if !dnsQuestionEqual(query, responseBody) {
+		writeGatewayError(w, http.StatusBadGateway, "upstream DNS response question mismatch")
+		return
+	}
 
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/dns-message")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(responseBody)
+}
+
+func (s *server) routes() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", s.health)
+	mux.HandleFunc("/dns-query", s.handleDoH)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeGatewayError(w, http.StatusNotFound, "not found")
+	})
+	return mux
 }
 
 func main() {
@@ -566,16 +692,9 @@ func main() {
 		trustProxy:  trustProxy,
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", s.health)
-	mux.HandleFunc("/dns-query", s.handleDoH)
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeGatewayError(w, http.StatusNotFound, "not found")
-	})
-
 	srv := &http.Server{
 		Addr:              port,
-		Handler:           mux,
+		Handler:           s.routes(),
 		ReadHeaderTimeout: 2 * time.Second,
 		ReadTimeout:       5 * time.Second,
 		WriteTimeout:      5 * time.Second,
@@ -583,7 +702,7 @@ func main() {
 		MaxHeaderBytes:    maxHeaderBytes,
 	}
 
-	log.Printf("DoH gateway listening on %s; rate=%d requests/%s; maxClients=%d; maxConcurrent=%d; trustProxy=%t", port, rate, defaultWindow, maxClients, maxConcurrent, trustProxy)
+	log.Printf("DoH gateway listening on %s; rate=%d requests/%s sliding window; maxClients=%d; maxConcurrent=%d; trustProxy=%t", port, rate, defaultWindow, maxClients, maxConcurrent, trustProxy)
 
 	serveErr := make(chan error, 1)
 	go func() {
