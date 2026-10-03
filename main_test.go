@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -161,6 +162,72 @@ func TestLimiterRejectsOnlyExpiredRequestsOutsideWindow(t *testing.T) {
 	}
 	if got := l.check("203.0.113.10", start.Add(60*time.Second)); got != limitRateLimited {
 		t.Fatalf("request with both timestamps in window got %v; want rate limited", got)
+	}
+}
+
+func TestLimiterRetryAfterReflectsOldestTimestamp(t *testing.T) {
+	l := newLimiter(2, 60*time.Second, 1024)
+	start := time.Unix(4_000_000, 0)
+	l.check("203.0.113.10", start)
+	l.check("203.0.113.10", start.Add(30*time.Second))
+	now := start.Add(31 * time.Second)
+	if got := l.check("203.0.113.10", now); got != limitRateLimited {
+		t.Fatalf("third request got %v; want rate limited", got)
+	}
+	if got := l.retryAfter("203.0.113.10", now); got != 29*time.Second {
+		t.Fatalf("retryAfter=%v; want 29s until the oldest request leaves the window", got)
+	}
+	if got := l.retryAfter("198.51.100.99", now); got != time.Second {
+		t.Fatalf("retryAfter for unknown client=%v; want 1s", got)
+	}
+}
+
+func TestRetryAfterSecondsRoundsUpAndClamps(t *testing.T) {
+	cases := map[time.Duration]int{
+		-time.Second:            1,
+		0:                       1,
+		500 * time.Millisecond:  1,
+		time.Second:             1,
+		1500 * time.Millisecond: 2,
+		60 * time.Second:        60,
+	}
+	for d, want := range cases {
+		if got := retryAfterSeconds(d); got != want {
+			t.Fatalf("retryAfterSeconds(%v)=%d; want %d", d, got, want)
+		}
+	}
+}
+
+func TestLimiterThrottlesEvictionScans(t *testing.T) {
+	l := newLimiter(1, time.Minute, 1)
+	now := time.Unix(6_000_000, 0)
+	stale := now.Add(-clientIdleTTL - time.Second)
+	l.clients = map[string]*clientState{
+		"198.51.100.1": {times: []time.Time{stale}, seen: stale},
+	}
+	l.lastEvict = now
+	if got := l.check("198.51.100.2", now.Add(500*time.Millisecond)); got != limitCapacity {
+		t.Fatalf("check inside the eviction interval got %v; want limitCapacity (scan throttled)", got)
+	}
+	if got := l.check("198.51.100.2", now.Add(evictInterval)); got != limitAllowed {
+		t.Fatalf("check after the eviction interval got %v; want allowed after stale-state eviction", got)
+	}
+}
+
+func TestLogGateSuppressesBurstsAndReportsCount(t *testing.T) {
+	var g logGate
+	t0 := time.Unix(5_000_000, 0)
+	if n, ok := g.allow(t0); !ok || n != 0 {
+		t.Fatalf("first message: ok=%v suppressed=%d; want allowed with 0 suppressed", ok, n)
+	}
+	if _, ok := g.allow(t0.Add(time.Second)); ok {
+		t.Fatal("message inside the interval was allowed")
+	}
+	if _, ok := g.allow(t0.Add(2 * time.Second)); ok {
+		t.Fatal("second message inside the interval was allowed")
+	}
+	if n, ok := g.allow(t0.Add(logInterval)); !ok || n != 2 {
+		t.Fatalf("message after the interval: ok=%v suppressed=%d; want allowed with 2 suppressed", ok, n)
 	}
 }
 
@@ -480,8 +547,11 @@ func TestDoHRateLimitExceeded(t *testing.T) {
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("third request status=%d; want 429, body=%q", rec.Code, rec.Body.String())
 	}
-	if got := rec.Header().Get("Retry-After"); got != "1" {
-		t.Fatalf("Retry-After=%q; want 1", got)
+	// Retry-After must reflect when the oldest request leaves the 60s window,
+	// not a fixed value that would invite immediate, futile retries.
+	secs, err := strconv.Atoi(rec.Header().Get("Retry-After"))
+	if err != nil || secs < 59 || secs > 60 {
+		t.Fatalf("Retry-After=%q; want about 60 seconds", rec.Header().Get("Retry-After"))
 	}
 	if backendCalls != 2 {
 		t.Fatalf("backend was called %d times; want 2", backendCalls)
@@ -682,6 +752,37 @@ func TestDoHRejectsInvalidUpstreamResponse(t *testing.T) {
 				t.Fatalf("status=%d; want 502, body=%q", rec.Code, rec.Body.String())
 			}
 		})
+	}
+}
+
+func TestDoHUpstreamTimeoutReturns504(t *testing.T) {
+	query := testDNSQuery(0x64)
+	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(testDNSResponse(query))
+	})
+	defer cleanup()
+	// A transport-level timeout is a net.Error, not context.DeadlineExceeded.
+	s.client = &http.Client{Transport: &http.Transport{ResponseHeaderTimeout: 50 * time.Millisecond}}
+
+	rec := postDoH(s, query, "")
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status=%d; want 504, body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDoHUpstreamConnectionFailureReturns502(t *testing.T) {
+	query := testDNSQuery(0x65)
+	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("backend must not be called")
+	})
+	defer cleanup()
+	s.backendURL = "http://127.0.0.1:1/dns-query"
+
+	rec := postDoH(s, query, "")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d; want 502, body=%q", rec.Code, rec.Body.String())
 	}
 }
 

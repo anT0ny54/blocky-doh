@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -38,13 +39,14 @@ const (
 	defaultMaxConcurrent  = 16
 	maxRateLimit          = 256
 	maxLimiterClients     = 1024
-	maxConcurrentLimit    = 16
 	maxDNSBody            = 65535
 	maxDNSResourceRecords = 4096
 	clientIdleTTL         = 2 * time.Minute
 	maxDNSNameHops        = 255
 	maxDNSNameLength      = 255
 	maxHeaderBytes        = 16 << 10
+	evictInterval         = time.Second
+	logInterval           = 10 * time.Second
 )
 
 // limitResult distinguishes an admitted request from the two rejection modes:
@@ -72,6 +74,7 @@ type limiter struct {
 	maxClients int
 	rate       int
 	window     time.Duration
+	lastEvict  time.Time
 }
 
 func newLimiter(rate int, window time.Duration, maxClients int) *limiter {
@@ -104,7 +107,12 @@ func (l *limiter) check(ip string, now time.Time) limitResult {
 	state := l.clients[ip]
 	if state == nil {
 		if len(l.clients) >= l.maxClients {
-			l.evictSomeLocked(now)
+			// Scanning every state is O(maxClients); throttle it so a flood
+			// of new client IPs cannot turn each request into a full scan.
+			if l.lastEvict.IsZero() || now.Sub(l.lastEvict) >= evictInterval {
+				l.lastEvict = now
+				l.evictStaleLocked(now)
+			}
 		}
 		if len(l.clients) >= l.maxClients {
 			// Never evict a live client state just to admit a new IP.
@@ -145,21 +153,80 @@ func (l *limiter) check(ip string, now time.Time) limitResult {
 	return limitAllowed
 }
 
-func (l *limiter) evictSomeLocked(now time.Time) {
+// evictStaleLocked drops every client state idle for longer than
+// clientIdleTTL. The caller must hold l.mu.
+func (l *limiter) evictStaleLocked(now time.Time) {
 	cutoff := now.Add(-clientIdleTTL)
-	removed := 0
 	for ip, state := range l.clients {
 		state.mu.Lock()
 		stale := state.seen.Before(cutoff)
 		state.mu.Unlock()
 		if stale {
 			delete(l.clients, ip)
-			removed++
-			if removed >= 2048 {
-				return
-			}
 		}
 	}
+}
+
+// retryAfter reports how long until ip's oldest in-window request leaves the
+// sliding window, i.e. the earliest moment a rejected client can be admitted.
+func (l *limiter) retryAfter(ip string, now time.Time) time.Duration {
+	l.mu.Lock()
+	state := l.clients[ip]
+	if state == nil {
+		l.mu.Unlock()
+		return time.Second
+	}
+	state.mu.Lock()
+	l.mu.Unlock()
+	defer state.mu.Unlock()
+	if len(state.times) == 0 {
+		return time.Second
+	}
+	if wait := state.times[0].Add(l.window).Sub(now); wait > time.Second {
+		return wait
+	}
+	return time.Second
+}
+
+// retryAfterSeconds converts d to whole seconds for a Retry-After header,
+// rounding up and never returning less than 1.
+func retryAfterSeconds(d time.Duration) int {
+	secs := int((d + time.Second - 1) / time.Second)
+	if secs < 1 {
+		return 1
+	}
+	return secs
+}
+
+// logGate lets at most one log line through per logInterval and counts the
+// rest, so floods of identical failures cannot turn logging into a resource
+// drain. The zero value is ready to use.
+type logGate struct {
+	last       atomic.Int64
+	suppressed atomic.Int64
+}
+
+// allow reports whether a message may be logged now, together with the number
+// of messages suppressed since the previous one that was let through.
+func (g *logGate) allow(now time.Time) (int64, bool) {
+	n := now.UnixNano()
+	last := g.last.Load()
+	if last != 0 && n-last < int64(logInterval) {
+		g.suppressed.Add(1)
+		return 0, false
+	}
+	if !g.last.CompareAndSwap(last, n) {
+		g.suppressed.Add(1)
+		return 0, false
+	}
+	return g.suppressed.Swap(0), true
+}
+
+func suppressedNote(n int64) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%d similar messages suppressed)", n)
 }
 
 func (l *limiter) cleanup(ctx context.Context) {
@@ -168,17 +235,8 @@ func (l *limiter) cleanup(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
-			now := time.Now()
-			cutoff := now.Add(-clientIdleTTL)
 			l.mu.Lock()
-			for ip, state := range l.clients {
-				state.mu.Lock()
-				stale := state.seen.Before(cutoff)
-				state.mu.Unlock()
-				if stale {
-					delete(l.clients, ip)
-				}
-			}
+			l.evictStaleLocked(time.Now())
 			l.mu.Unlock()
 		case <-ctx.Done():
 			return
@@ -193,6 +251,8 @@ type server struct {
 	limiter     *limiter
 	concurrent  chan struct{}
 	trustProxy  bool
+	capacityLog logGate
+	upstreamLog logGate
 }
 
 func parseEnvInt(name string, def, max int) int {
@@ -237,8 +297,10 @@ func clientIP(r *http.Request, trustProxy bool) string {
 				}
 			}
 		}
-		if rip := strings.TrimSpace(r.Header.Get("X-Real-IP")); net.ParseIP(rip) != nil {
-			return net.ParseIP(rip).String()
+		if rip := strings.TrimSpace(r.Header.Get("X-Real-IP")); rip != "" {
+			if ip := net.ParseIP(rip); ip != nil {
+				return ip.String()
+			}
 		}
 	}
 	host := strings.TrimSpace(r.RemoteAddr)
@@ -285,6 +347,10 @@ func decodeDoHQuery(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 		encoded := r.URL.Query().Get("dns")
 		if encoded == "" {
 			return nil, errMissingDNSParameter
+		}
+		// Reject oversized input before allocating the decoded buffer.
+		if len(encoded) > base64.RawURLEncoding.EncodedLen(maxDNSBody) {
+			return nil, errDNSMessageTooLarge
 		}
 		decoded, err := base64.RawURLEncoding.DecodeString(encoded)
 		if err != nil {
@@ -435,9 +501,8 @@ func expandDNSName(message []byte, offset int) (string, int, error) {
 	}
 }
 
-// dnsQuestionEqual reports whether the question sections of query and
-// response carry the same owner name (compression-expanded) and QTYPE/QCLASS,
-// so a confused upstream cannot swap answers between different questions.
+// dnsNameEqual reports whether two compression-expanded DNS owner names are
+// identical, comparing ASCII letters case-insensitively as DNS requires.
 func dnsNameEqual(a, b string) bool {
 	if len(a) != len(b) {
 		return false
@@ -563,14 +628,18 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch s.limiter.check(clientIP(r, s.trustProxy), time.Now()) {
+	ip := clientIP(r, s.trustProxy)
+	now := time.Now()
+	switch s.limiter.check(ip, now) {
 	case limitAllowed:
 	case limitRateLimited:
-		w.Header().Set("Retry-After", "1")
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(s.limiter.retryAfter(ip, now))))
 		writeGatewayError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	default: // limitCapacity
-		log.Printf("client limiter at capacity (%d states); rejecting new client", s.limiter.maxClients)
+		if n, ok := s.capacityLog.allow(now); ok {
+			log.Printf("client limiter at capacity (%d states); rejecting new clients%s", s.limiter.maxClients, suppressedNote(n))
+		}
 		writeGatewayError(w, http.StatusServiceUnavailable, "server busy")
 		return
 	}
@@ -615,15 +684,23 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	backendReq.Header.Set("Content-Type", "application/dns-message")
 	backendReq.Header.Set("Accept", "application/dns-message")
 	backendReq.Header.Set("User-Agent", "hagezi-doh/1.0")
-	backendReq.ContentLength = int64(len(query))
 
 	resp, err := s.client.Do(backendReq)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			// The client went away; there is nobody to answer and nothing to log.
+			return
+		}
 		status := http.StatusBadGateway
-		if errors.Is(err, context.DeadlineExceeded) {
+		// Transport timeouts (e.g. ResponseHeaderTimeout) are net.Errors rather
+		// than context.DeadlineExceeded, so check both to report 504 correctly.
+		var netErr net.Error
+		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
 			status = http.StatusGatewayTimeout
 		}
-		log.Printf("upstream DNS request failed: %v", err)
+		if n, ok := s.upstreamLog.allow(time.Now()); ok {
+			log.Printf("upstream DNS request failed: %v%s", err, suppressedNote(n))
+		}
 		writeGatewayError(w, status, "upstream DNS service unavailable")
 		return
 	}
@@ -646,7 +723,9 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, http.StatusBadGateway, "invalid upstream DNS response")
 		return
 	}
-	if len(responseBody) < 2 || len(query) < 2 || !bytes.Equal(responseBody[:2], query[:2]) {
+	// Both messages already passed validateDNSMessage, which requires at
+	// least a 12-byte DNS header, so the two-byte transaction ID read is safe.
+	if !bytes.Equal(responseBody[:2], query[:2]) {
 		writeGatewayError(w, http.StatusBadGateway, "upstream DNS transaction ID mismatch")
 		return
 	}
@@ -683,7 +762,8 @@ func main() {
 
 	rate := parseEnvInt("RATE_LIMIT", defaultRate, maxRateLimit)
 	maxClients := parseEnvInt("MAX_CLIENTS", defaultMaxClients, maxLimiterClients)
-	maxConcurrent := parseEnvInt("MAX_CONCURRENT", defaultMaxConcurrent, maxConcurrentLimit)
+	// defaultMaxConcurrent is both the default and the hard cap for MAX_CONCURRENT.
+	maxConcurrent := parseEnvInt("MAX_CONCURRENT", defaultMaxConcurrent, defaultMaxConcurrent)
 	trustProxy := parseEnvBool("TRUST_PROXY", false)
 	lim := newLimiter(rate, defaultWindow, maxClients)
 
@@ -692,7 +772,6 @@ func main() {
 	go lim.cleanup(ctx)
 
 	transport := &http.Transport{
-		Proxy:                  nil,
 		MaxIdleConns:           16,
 		MaxIdleConnsPerHost:    16,
 		MaxConnsPerHost:        maxConcurrent,
@@ -700,7 +779,6 @@ func main() {
 		DisableCompression:     true,
 		ResponseHeaderTimeout:  2500 * time.Millisecond,
 		MaxResponseHeaderBytes: maxHeaderBytes,
-		TLSHandshakeTimeout:    1500 * time.Millisecond,
 	}
 
 	s := &server{

@@ -1,8 +1,7 @@
-# Builder: exact Go toolchain + Blocky binary source
+# Builder: pinned Go toolchain; compiles and tests the gateway
 FROM golang:1.27.1-alpine AS builder
 
 ENV CGO_ENABLED=0 \
-    GO111MODULE=on \
     GOTOOLCHAIN=local
 
 WORKDIR /src
@@ -16,23 +15,19 @@ RUN go vet ./... && \
     go test ./... && \
     go build -trimpath -ldflags='-s -w' -o /out/doh-gateway .
 
-# Pull the official latest stable Blocky release directly from its published image.
-# v0.35.0 is the current latest stable release as of 2026-09-29.
-COPY --from=ghcr.io/0xerr0r/blocky:v0.35.0 /app/blocky /out/blocky
-
-
 # Final runtime: no Go toolchain kept in the image.
 FROM alpine:3.24
 
-# wget is used by the health check; ca-certificates are needed for HTTPS upstreams.
-RUN apk add --no-cache ca-certificates wget && \
+# ca-certificates are needed for HTTPS upstreams. The health check uses BusyBox
+# wget, which is already part of the Alpine base image.
+RUN apk add --no-cache ca-certificates && \
     addgroup -S app && \
-    adduser -S -G app -H app && \
-    mkdir -p /etc/blocky && \
-    chown -R app:app /etc/blocky
+    adduser -S -G app -H app
 
 COPY --from=builder /out/doh-gateway /doh-gateway
-COPY --from=builder /out/blocky /blocky
+# Take the official latest stable Blocky release (v0.35.0 as of 2026-09-29)
+# directly from its published image instead of cloning/building from source.
+COPY --from=ghcr.io/0xerr0r/blocky:v0.35.0 /app/blocky /blocky
 COPY config.yml /etc/blocky/config.yml
 COPY entrypoint.sh /entrypoint.sh
 

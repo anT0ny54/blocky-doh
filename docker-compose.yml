@@ -8,5 +8,5 @@ services:
     # stays keyed on the real peer address. (The production image defaults to
     # TRUST_PROXY=true because SnapDeploy's load balancer is the trusted proxy.)
     environment:
-      TRUST_PROXY: "true"
+      TRUST_PROXY: "false"
     restart: unless-stopped

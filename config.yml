@@ -31,8 +31,8 @@ upstreams:
       - https://juuri.hagezi.org/dns-query
 
 ports:
-  # Blocky is intentionally reachable only by the local DoH gateway.
-  # Blocky's DoH is available only on loopback; the gateway exposes the public /dns-query path.
+  # Blocky's DoH listener is reachable only on loopback, by the local gateway,
+  # which exposes the public /dns-query path.
   http: 127.0.0.1:8053
 
 # Keep memory predictable on the 512 MB tier.
