@@ -1,14 +1,4 @@
-# Minimal Blocky v0.35.0 configuration for a public DoH service.
-# The public listener is the Go DNS-only gateway; Blocky stays private on loopback.
-
 connectIPVersion: v4
-
-# Prevent bootstrap lookups for the DoH upstream hostnames from falling back to
-# the container's general-purpose resolver. The IPs are used only to reach the
-# named HTTPS endpoints; TLS still uses the configured hostnames/SNI.
-#
-# NOTE: keep this list in sync with upstreams.groups.default below. Each named
-# HTTPS upstream needs a bootstrap entry with its fixed IP.
 bootstrapDns:
   - upstream: https://root.hagezi.org/dns-query
     ips:
@@ -19,29 +9,20 @@ bootstrapDns:
   - upstream: https://juuri.hagezi.org/dns-query
     ips:
       - 95.217.163.17
-
 upstreams:
   strategy: random
-  # Keep each failed upstream attempt below the gateway's 3s request deadline.
   timeout: 1200ms
   groups:
     default:
       - https://root.hagezi.org/dns-query
       - https://wurzn.hagezi.org/dns-query
       - https://juuri.hagezi.org/dns-query
-
 ports:
-  # Blocky's DoH listener is reachable only on loopback, by the local gateway,
-  # which exposes the public /dns-query path.
   http: 127.0.0.1:8053
-
-# Keep memory predictable on the 512 MB tier.
 caching:
   maxItemsCount: 32768
   prefetching: false
   cacheTimeNegative: 5m
-
-# No blocklists, statistics, Prometheus, API, or query logging: this is a lean resolver.
 log:
   level: warn
   format: text

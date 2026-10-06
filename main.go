@@ -1,5 +1,4 @@
 package main
-
 import (
 	"bytes"
 	"context"
@@ -20,7 +19,6 @@ import (
 	"syscall"
 	"time"
 )
-
 var (
 	errMissingDNSParameter = errors.New("missing dns parameter")
 	errInvalidDNSParameter = errors.New("invalid dns parameter")
@@ -28,7 +26,6 @@ var (
 	errInvalidContentType  = errors.New("invalid content type")
 	errFailedReadDNSBody   = errors.New("failed to read dns message")
 )
-
 const (
 	defaultPort           = "8080"
 	defaultBackendURL     = "http://127.0.0.1:8053/dns-query"
@@ -48,26 +45,17 @@ const (
 	evictInterval         = time.Second
 	logInterval           = 10 * time.Second
 )
-
-// limitResult distinguishes an admitted request from the two rejection modes:
-// the client exceeded its per-window rate budget, or the client table itself
-// is full and no state can be admitted.
 type limitResult int
-
 const (
 	limitAllowed limitResult = iota
 	limitRateLimited
 	limitCapacity
 )
-
-// clientState tracks one client's request timestamps inside the sliding
-// rate-limit window. The slice holds at most l.rate entries.
 type clientState struct {
 	mu    sync.Mutex
 	times []time.Time
 	seen  time.Time
 }
-
 type limiter struct {
 	mu         sync.Mutex
 	clients    map[string]*clientState
@@ -76,7 +64,6 @@ type limiter struct {
 	window     time.Duration
 	lastEvict  time.Time
 }
-
 func newLimiter(rate int, window time.Duration, maxClients int) *limiter {
 	if rate < 1 {
 		rate = defaultRate
@@ -93,13 +80,8 @@ func newLimiter(rate int, window time.Duration, maxClients int) *limiter {
 		window:     window,
 	}
 }
-
-// check admits ip if fewer than l.rate of its requests fall inside the
-// sliding window (now-l.window, now]. It returns limitCapacity when the
-// client table is full and no idle state can be evicted.
 func (l *limiter) check(ip string, now time.Time) limitResult {
 	cutoff := now.Add(-l.window)
-
 	l.mu.Lock()
 	if l.clients == nil {
 		l.clients = make(map[string]*clientState)
@@ -107,34 +89,20 @@ func (l *limiter) check(ip string, now time.Time) limitResult {
 	state := l.clients[ip]
 	if state == nil {
 		if len(l.clients) >= l.maxClients {
-			// Scanning every state is O(maxClients); throttle it so a flood
-			// of new client IPs cannot turn each request into a full scan.
 			if l.lastEvict.IsZero() || now.Sub(l.lastEvict) >= evictInterval {
 				l.lastEvict = now
 				l.evictStaleLocked(now)
 			}
 		}
 		if len(l.clients) >= l.maxClients {
-			// Never evict a live client state just to admit a new IP.
-			// Preserving the existing state keeps the per-client limit intact
-			// and avoids splitting one client's rate history across two states.
 			l.mu.Unlock()
 			return limitCapacity
 		}
 		state = &clientState{}
 		l.clients[ip] = state
 	}
-
-	// Keep the map lock while acquiring the state lock. Cleanup and eviction
-	// use the same lock order, so a state cannot be deleted between lookup and use.
 	state.mu.Lock()
 	l.mu.Unlock()
-
-	// Drop timestamps that fell outside the sliding window, then admit the
-	// request only if fewer than l.rate requests remain inside it. Only
-	// admitted requests refresh liveness: an over-budget client still has
-	// recent admitted traffic, while rejected requests must not keep a state
-	// alive forever and starve the fixed-size client table.
 	kept := state.times[:0]
 	for _, t := range state.times {
 		if t.After(cutoff) {
@@ -142,7 +110,6 @@ func (l *limiter) check(ip string, now time.Time) limitResult {
 		}
 	}
 	state.times = kept
-
 	if len(state.times) >= l.rate {
 		state.mu.Unlock()
 		return limitRateLimited
@@ -152,9 +119,6 @@ func (l *limiter) check(ip string, now time.Time) limitResult {
 	state.mu.Unlock()
 	return limitAllowed
 }
-
-// evictStaleLocked drops every client state idle for longer than
-// clientIdleTTL. The caller must hold l.mu.
 func (l *limiter) evictStaleLocked(now time.Time) {
 	cutoff := now.Add(-clientIdleTTL)
 	for ip, state := range l.clients {
@@ -166,9 +130,6 @@ func (l *limiter) evictStaleLocked(now time.Time) {
 		}
 	}
 }
-
-// retryAfter reports how long until ip's oldest in-window request leaves the
-// sliding window, i.e. the earliest moment a rejected client can be admitted.
 func (l *limiter) retryAfter(ip string, now time.Time) time.Duration {
 	l.mu.Lock()
 	state := l.clients[ip]
@@ -187,9 +148,6 @@ func (l *limiter) retryAfter(ip string, now time.Time) time.Duration {
 	}
 	return time.Second
 }
-
-// retryAfterSeconds converts d to whole seconds for a Retry-After header,
-// rounding up and never returning less than 1.
 func retryAfterSeconds(d time.Duration) int {
 	secs := int((d + time.Second - 1) / time.Second)
 	if secs < 1 {
@@ -197,17 +155,10 @@ func retryAfterSeconds(d time.Duration) int {
 	}
 	return secs
 }
-
-// logGate lets at most one log line through per logInterval and counts the
-// rest, so floods of identical failures cannot turn logging into a resource
-// drain. The zero value is ready to use.
 type logGate struct {
 	last       atomic.Int64
 	suppressed atomic.Int64
 }
-
-// allow reports whether a message may be logged now, together with the number
-// of messages suppressed since the previous one that was let through.
 func (g *logGate) allow(now time.Time) (int64, bool) {
 	n := now.UnixNano()
 	last := g.last.Load()
@@ -221,14 +172,12 @@ func (g *logGate) allow(now time.Time) (int64, bool) {
 	}
 	return g.suppressed.Swap(0), true
 }
-
 func suppressedNote(n int64) string {
 	if n == 0 {
 		return ""
 	}
 	return fmt.Sprintf(" (%d similar messages suppressed)", n)
 }
-
 func (l *limiter) cleanup(ctx context.Context) {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
@@ -243,7 +192,6 @@ func (l *limiter) cleanup(ctx context.Context) {
 		}
 	}
 }
-
 type server struct {
 	client      *http.Client
 	backendURL  string
@@ -254,7 +202,6 @@ type server struct {
 	capacityLog logGate
 	upstreamLog logGate
 }
-
 func parseEnvInt(name string, def, max int) int {
 	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
@@ -266,7 +213,6 @@ func parseEnvInt(name string, def, max int) int {
 	}
 	return n
 }
-
 func parseEnvBool(name string, def bool) bool {
 	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
@@ -281,12 +227,6 @@ func parseEnvBool(name string, def bool) bool {
 		return def
 	}
 }
-
-// clientIP resolves the rate-limit client identity. With trustProxy, the
-// rightmost parseable X-Forwarded-For entry wins, then X-Real-IP, then the
-// TCP peer. Every returned address is normalized via net.IP.String so that
-// IPv6 clients cannot occupy several limiter states through alternate
-// textual encodings of the same address.
 func clientIP(r *http.Request, trustProxy bool) string {
 	if trustProxy {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
@@ -312,21 +252,18 @@ func clientIP(r *http.Request, trustProxy bool) string {
 	}
 	return host
 }
-
 func (s *server) health(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		writeGatewayError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-
 	conn, err := net.DialTimeout("tcp", s.backendAddr, 250*time.Millisecond)
 	if err != nil {
 		writeGatewayError(w, http.StatusServiceUnavailable, "dns backend unavailable")
 		return
 	}
 	_ = conn.Close()
-
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -334,21 +271,16 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	}
 }
-
 func writeGatewayError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Cache-Control", "no-store")
 	http.Error(w, msg, code)
 }
-
-// decodeDoHQuery extracts the DNS wire message from a DoH request. The caller
-// must already have restricted r.Method to GET or POST.
 func decodeDoHQuery(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	if r.Method == http.MethodGet {
 		encoded := r.URL.Query().Get("dns")
 		if encoded == "" {
 			return nil, errMissingDNSParameter
 		}
-		// Reject oversized input before allocating the decoded buffer.
 		if len(encoded) > base64.RawURLEncoding.EncodedLen(maxDNSBody) {
 			return nil, errDNSMessageTooLarge
 		}
@@ -361,11 +293,9 @@ func decodeDoHQuery(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 		}
 		return decoded, nil
 	}
-
 	if !validContentType(r.Header.Get("Content-Type")) {
 		return nil, errInvalidContentType
 	}
-
 	r.Body = http.MaxBytesReader(w, r.Body, maxDNSBody)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -377,12 +307,10 @@ func decodeDoHQuery(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	}
 	return body, nil
 }
-
 func skipDNSName(message []byte, offset int) (int, error) {
 	if offset < 0 || offset >= len(message) {
 		return 0, errors.New("dns name offset out of bounds")
 	}
-
 	pos := offset
 	returnOffset := offset
 	jumped := false
@@ -439,11 +367,6 @@ func skipDNSName(message []byte, offset int) (int, error) {
 		}
 	}
 }
-
-// expandDNSName walks a possibly compressed DNS name starting at offset and
-// returns its canonical dot-separated text form together with the offset of
-// the first byte after the name in message (the position following the
-// pointer when compression was used).
 func expandDNSName(message []byte, offset int) (string, int, error) {
 	var b strings.Builder
 	pos := offset
@@ -500,9 +423,6 @@ func expandDNSName(message []byte, offset int) (string, int, error) {
 		}
 	}
 }
-
-// dnsNameEqual reports whether two compression-expanded DNS owner names are
-// identical, comparing ASCII letters case-insensitively as DNS requires.
 func dnsNameEqual(a, b string) bool {
 	if len(a) != len(b) {
 		return false
@@ -521,10 +441,6 @@ func dnsNameEqual(a, b string) bool {
 	}
 	return true
 }
-
-// dnsQuestionEqual reports whether the question sections of query and
-// response carry the same owner name (compression-expanded) and QTYPE/QCLASS,
-// so a confused upstream cannot swap answers between different questions.
 func dnsQuestionEqual(query, response []byte) bool {
 	qName, qEnd, err := expandDNSName(query, 12)
 	if err != nil {
@@ -539,19 +455,15 @@ func dnsQuestionEqual(query, response []byte) bool {
 	}
 	return bytes.Equal(query[qEnd:qEnd+4], response[rEnd:rEnd+4])
 }
-
 func validateDNSMessage(message []byte, response bool) error {
 	if len(message) < 12 {
 		return errors.New("dns message too short")
 	}
-
 	flags := uint16(message[2])<<8 | uint16(message[3])
 	qr := flags&0x8000 != 0
 	if qr != response {
 		return errors.New("unexpected dns QR flag")
 	}
-	// A zero (or any non-1) question count is rejected by the qdCount != 1
-	// check below, so no separate "no question" check is needed here.
 	qdCount := int(uint16(message[4])<<8 | uint16(message[5]))
 	anCount := int(uint16(message[6])<<8 | uint16(message[7]))
 	nsCount := int(uint16(message[8])<<8 | uint16(message[9]))
@@ -562,16 +474,11 @@ func validateDNSMessage(message []byte, response bool) error {
 	if anCount+nsCount+arCount > maxDNSResourceRecords {
 		return errors.New("dns resource record count exceeds limit")
 	}
-	// A question needs at least a root label plus QTYPE/QCLASS (5 bytes);
-	// an RR needs at least a root owner plus its fixed 10-byte header.
-	// Reject impossible counts early so hostile packets cannot force large
-	// parser loops before the normal bounds checks fail.
 	minBytes := qdCount*5 + (anCount+nsCount+arCount)*11
 	if minBytes > len(message)-12 {
 		return errors.New("dns section counts exceed message size")
 	}
 	offset := 12
-
 	for i := 0; i < qdCount; i++ {
 		var err error
 		offset, err = skipDNSName(message, offset)
@@ -583,7 +490,6 @@ func validateDNSMessage(message []byte, response bool) error {
 		}
 		offset += 4
 	}
-
 	for _, count := range []int{anCount, nsCount, arCount} {
 		for i := 0; i < count; i++ {
 			var err error
@@ -602,18 +508,15 @@ func validateDNSMessage(message []byte, response bool) error {
 			offset += rdLength
 		}
 	}
-
 	if offset != len(message) {
 		return errors.New("trailing bytes after dns message")
 	}
 	return nil
 }
-
 func validContentType(value string) bool {
 	mediaType, _, err := mime.ParseMediaType(value)
 	return err == nil && strings.EqualFold(mediaType, "application/dns-message")
 }
-
 func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -627,7 +530,6 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-
 	ip := clientIP(r, s.trustProxy)
 	now := time.Now()
 	switch s.limiter.check(ip, now) {
@@ -636,14 +538,13 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(s.limiter.retryAfter(ip, now))))
 		writeGatewayError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
-	default: // limitCapacity
+	default: 
 		if n, ok := s.capacityLog.allow(now); ok {
 			log.Printf("client limiter at capacity (%d states); rejecting new clients%s", s.limiter.maxClients, suppressedNote(n))
 		}
 		writeGatewayError(w, http.StatusServiceUnavailable, "server busy")
 		return
 	}
-
 	query, err := decodeDoHQuery(w, r)
 	if err != nil {
 		if errors.Is(err, errInvalidContentType) {
@@ -657,14 +558,10 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
 	if err := validateDNSMessage(query, false); err != nil {
 		writeGatewayError(w, http.StatusBadRequest, "invalid dns message")
 		return
 	}
-
-	// Acquire the concurrency slot only after the body has been read and
-	// validated so slow or malformed uploads cannot occupy slots.
 	select {
 	case s.concurrent <- struct{}{}:
 		defer func() { <-s.concurrent }()
@@ -672,10 +569,8 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, http.StatusServiceUnavailable, "server busy")
 		return
 	}
-
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
-
 	backendReq, err := http.NewRequestWithContext(ctx, http.MethodPost, s.backendURL, bytes.NewReader(query))
 	if err != nil {
 		writeGatewayError(w, http.StatusInternalServerError, "request creation failed")
@@ -684,16 +579,12 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	backendReq.Header.Set("Content-Type", "application/dns-message")
 	backendReq.Header.Set("Accept", "application/dns-message")
 	backendReq.Header.Set("User-Agent", "hagezi-doh/1.0")
-
 	resp, err := s.client.Do(backendReq)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			// The client went away; there is nobody to answer and nothing to log.
 			return
 		}
 		status := http.StatusBadGateway
-		// Transport timeouts (e.g. ResponseHeaderTimeout) are net.Errors rather
-		// than context.DeadlineExceeded, so check both to report 504 correctly.
 		var netErr net.Error
 		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
 			status = http.StatusGatewayTimeout
@@ -709,7 +600,6 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, http.StatusBadGateway, "invalid upstream DNS response")
 		return
 	}
-
 	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxDNSBody+1))
 	if err != nil {
 		writeGatewayError(w, http.StatusBadGateway, "invalid upstream DNS response")
@@ -723,8 +613,6 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, http.StatusBadGateway, "invalid upstream DNS response")
 		return
 	}
-	// Both messages already passed validateDNSMessage, which requires at
-	// least a 12-byte DNS header, so the two-byte transaction ID read is safe.
 	if !bytes.Equal(responseBody[:2], query[:2]) {
 		writeGatewayError(w, http.StatusBadGateway, "upstream DNS transaction ID mismatch")
 		return
@@ -733,14 +621,12 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, http.StatusBadGateway, "upstream DNS response question mismatch")
 		return
 	}
-
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/dns-message")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(responseBody)
 }
-
 func (s *server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.health)
@@ -750,7 +636,6 @@ func (s *server) routes() *http.ServeMux {
 	})
 	return mux
 }
-
 func main() {
 	port := strings.TrimSpace(os.Getenv("PORT"))
 	if port == "" {
@@ -759,18 +644,14 @@ func main() {
 	if !strings.HasPrefix(port, ":") {
 		port = ":" + port
 	}
-
 	rate := parseEnvInt("RATE_LIMIT", defaultRate, maxRateLimit)
 	maxClients := parseEnvInt("MAX_CLIENTS", defaultMaxClients, maxLimiterClients)
-	// defaultMaxConcurrent is both the default and the hard cap for MAX_CONCURRENT.
 	maxConcurrent := parseEnvInt("MAX_CONCURRENT", defaultMaxConcurrent, defaultMaxConcurrent)
 	trustProxy := parseEnvBool("TRUST_PROXY", false)
 	lim := newLimiter(rate, defaultWindow, maxClients)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go lim.cleanup(ctx)
-
 	transport := &http.Transport{
 		MaxIdleConns:           16,
 		MaxIdleConnsPerHost:    16,
@@ -780,7 +661,6 @@ func main() {
 		ResponseHeaderTimeout:  2500 * time.Millisecond,
 		MaxResponseHeaderBytes: maxHeaderBytes,
 	}
-
 	s := &server{
 		client: &http.Client{
 			Transport: transport,
@@ -794,7 +674,6 @@ func main() {
 		concurrent:  make(chan struct{}, maxConcurrent),
 		trustProxy:  trustProxy,
 	}
-
 	srv := &http.Server{
 		Addr:              port,
 		Handler:           s.routes(),
@@ -804,17 +683,13 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    maxHeaderBytes,
 	}
-
 	log.Printf("DoH gateway listening on %s; rate=%d requests/%s sliding window; maxClients=%d; maxConcurrent=%d; trustProxy=%t", port, rate, defaultWindow, maxClients, maxConcurrent, trustProxy)
-
 	serveErr := make(chan error, 1)
 	go func() {
 		serveErr <- srv.ListenAndServe()
 	}()
-
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
 	select {
 	case err := <-serveErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
