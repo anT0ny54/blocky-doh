@@ -25,7 +25,7 @@ RUN git clone \
         --branch "${BLOCKY_VERSION}" \
         https://github.com/0xERR0R/blocky.git .
 RUN go mod download && \
-    make build && \
+    make build BIN_OUT_DIR=/bin && \
     test -x /bin/blocky
 FROM alpine:3.24
 RUN apk add --no-cache ca-certificates && \
