@@ -8,17 +8,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 func testDNSQuery(id byte) []byte {
 	return []byte{
-		id, 0x34, 0x01, 0x00, 
-		0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+		id, 0x34, 0x01, 0x00,
+		0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
 		0x03, 'c', 'o', 'm', 0x00,
-		0x00, 0x01, 0x00, 0x01, 
+		0x00, 0x01, 0x00, 0x01,
 	}
 }
 func testDNSResponse(query []byte) []byte {
@@ -314,10 +315,10 @@ func testDNSResponseWithAnswerRecords(query []byte, count int) []byte {
 	message = append(message, query[12:]...)
 	for i := 0; i < count; i++ {
 		message = append(message,
-			0x00,                   
-			0x00, 0x01, 0x00, 0x01, 
-			0x00, 0x00, 0x00, 0x00, 
-			0x00, 0x00, 
+			0x00,
+			0x00, 0x01, 0x00, 0x01,
+			0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00,
 		)
 	}
 	return message
@@ -367,7 +368,7 @@ func TestDNSQuestionEqual(t *testing.T) {
 		t.Fatal("response with different question name was accepted")
 	}
 	mismatchType := append([]byte(nil), response...)
-	mismatchType[25], mismatchType[26] = 0x00, 0x02 
+	mismatchType[25], mismatchType[26] = 0x00, 0x02
 	if dnsQuestionEqual(query, mismatchType) {
 		t.Fatal("response with different question QTYPE was accepted")
 	}
@@ -800,6 +801,17 @@ func TestClientIPUsesRightmostValidForwardedAddress(t *testing.T) {
 		t.Fatalf("clientIP=%q; want 203.0.113.9", got)
 	}
 }
+func TestClientIPUsesRightmostAcrossMultipleForwardedHeaders(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
+	req.RemoteAddr = "192.0.2.10:1234"
+	// A client-supplied header line followed by a separate line appended by
+	// the trusted proxy: the proxy's (rightmost) address must win.
+	req.Header.Add("X-Forwarded-For", "198.51.100.7")
+	req.Header.Add("X-Forwarded-For", "203.0.113.9")
+	if got := clientIP(req, true); got != "203.0.113.9" {
+		t.Fatalf("clientIP=%q; want 203.0.113.9", got)
+	}
+}
 func TestClientIPNormalizesIPv6(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
 	req.RemoteAddr = "[2001:0db8:0000:0000:0000:0000:0000:0001]:443"
@@ -881,5 +893,111 @@ func TestValidContentType(t *testing.T) {
 				t.Fatalf("validContentType(%q)=%v; want %v", value, got, want)
 			}
 		})
+	}
+}
+func TestDoHInvalidRequestsDoNotConsumeRateBudget(t *testing.T) {
+	backendCalls := 0
+	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		backendCalls++
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(testDNSResponse(testDNSQuery(0x91)))
+	})
+	defer cleanup()
+	s.limiter = newLimiter(2, time.Minute, 1024)
+	query := testDNSQuery(0x91)
+	if rec := postDoH(s, query, ""); rec.Code != http.StatusOK {
+		t.Fatalf("first valid request status=%d; want 200", rec.Code)
+	}
+	badReq := httptest.NewRequest(http.MethodPost, "http://gateway.test/dns-query", bytes.NewReader([]byte{1, 2, 3, 4}))
+	badReq.Header.Set("Content-Type", "application/dns-message")
+	rec := httptest.NewRecorder()
+	s.handleDoH(rec, badReq)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid request status=%d; want 400", rec.Code)
+	}
+	// The rejected request must not have charged the client's window.
+	if rec := postDoH(s, query, ""); rec.Code != http.StatusOK {
+		t.Fatalf("second valid request status=%d; want 200 (invalid request consumed rate budget)", rec.Code)
+	}
+	if rec := postDoH(s, query, ""); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("third valid request status=%d; want 429", rec.Code)
+	}
+	if backendCalls != 2 {
+		t.Fatalf("backend called %d times; want 2", backendCalls)
+	}
+}
+
+func TestLimiterRefreshesSeenOnRateLimitedRequests(t *testing.T) {
+	l := newLimiter(1, time.Minute, 2)
+	now := time.Unix(7_000_000, 0)
+	if got := l.check("198.51.100.1", now); got != limitAllowed {
+		t.Fatalf("first request got %v; want allowed", got)
+	}
+	rejected := now.Add(90 * time.Second) // past the 2-minute idle TTL
+	if got := l.check("198.51.100.1", rejected); got != limitRateLimited {
+		t.Fatalf("second request got %v; want rate limited", got)
+	}
+	if got := l.clients["198.51.100.1"].seen; !got.Equal(rejected) {
+		t.Fatalf("seen=%v; want %v refreshed by the rejected request", got, rejected)
+	}
+}
+
+func TestLimiterKeepsPersistentlyRateLimitedClientAtCapacity(t *testing.T) {
+	l := newLimiter(1, time.Minute, 1)
+	start := time.Unix(8_000_000, 0)
+	if got := l.check("198.51.100.1", start); got != limitAllowed {
+		t.Fatalf("first request got %v; want allowed", got)
+	}
+	last := start
+	for i := 0; i < 6; i++ { // 20s steps keep the 60s window non-empty
+		last = last.Add(20 * time.Second)
+		if got := l.check("198.51.100.1", last); got != limitRateLimited {
+			t.Fatalf("follow-up request %d got %v; want rate limited", i+2, got)
+		}
+	}
+	// The throttled-but-active client must not be evictable as idle.
+	if got := l.check("198.51.100.2", last); got != limitCapacity {
+		t.Fatalf("new client got %v; want limitCapacity", got)
+	}
+}
+
+func TestDoHRejectsOversizedGETQueryStringBeforeParsing(t *testing.T) {
+	backendCalls := 0
+	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		backendCalls++
+	})
+	defer cleanup()
+	encoded := base64.RawURLEncoding.EncodeToString(testDNSQuery(0x92))
+	// Valid dns= parameter, but the raw query string as a whole exceeds the
+	// maximum legitimate size; it must be rejected as 413 without parsing
+	// and without touching the backend.
+	junk := strings.Repeat("x", len("dns=")+base64.RawURLEncoding.EncodedLen(maxDNSBody))
+	rawQuery := "dns=" + encoded + "&pad=" + junk
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/dns-query", nil)
+	req.URL.RawQuery = rawQuery
+	rec := httptest.NewRecorder()
+	s.handleDoH(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d; want 413, body=%q", rec.Code, rec.Body.String())
+	}
+	if backendCalls != 0 {
+		t.Fatalf("backend was called %d times; want 0", backendCalls)
+	}
+}
+
+func TestDoHHeadRequestIsRejected(t *testing.T) {
+	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("backend must not be called for HEAD")
+	})
+	defer cleanup()
+	encoded := base64.RawURLEncoding.EncodeToString(testDNSQuery(0x93))
+	req := httptest.NewRequest(http.MethodHead, "http://gateway.test/dns-query?dns="+encoded, nil)
+	rec := httptest.NewRecorder()
+	s.handleDoH(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("HEAD status=%d; want 405, body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Allow"); got != "GET, POST, OPTIONS" {
+		t.Fatalf("Allow=%q; want GET, POST, OPTIONS", got)
 	}
 }

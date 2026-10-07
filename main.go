@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -110,12 +109,15 @@ func (l *limiter) check(ip string, now time.Time) limitResult {
 		}
 	}
 	state.times = kept
+	// Refresh liveness for every request, including rejected ones, so a
+	// persistently rate-limited client is not evicted as "idle" while it
+	// is still actively (if unsuccessfully) reaching the gateway.
+	state.seen = now
 	if len(state.times) >= l.rate {
 		state.mu.Unlock()
 		return limitRateLimited
 	}
 	state.times = append(state.times, now)
-	state.seen = now
 	state.mu.Unlock()
 	return limitAllowed
 }
@@ -156,21 +158,21 @@ func retryAfterSeconds(d time.Duration) int {
 	return secs
 }
 type logGate struct {
-	last       atomic.Int64
-	suppressed atomic.Int64
+	mu         sync.Mutex
+	last       time.Time
+	suppressed int64
 }
 func (g *logGate) allow(now time.Time) (int64, bool) {
-	n := now.UnixNano()
-	last := g.last.Load()
-	if last != 0 && n-last < int64(logInterval) {
-		g.suppressed.Add(1)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.last.IsZero() && now.Sub(g.last) < logInterval {
+		g.suppressed++
 		return 0, false
 	}
-	if !g.last.CompareAndSwap(last, n) {
-		g.suppressed.Add(1)
-		return 0, false
-	}
-	return g.suppressed.Swap(0), true
+	g.last = now
+	n := g.suppressed
+	g.suppressed = 0
+	return n, true
 }
 func suppressedNote(n int64) string {
 	if n == 0 {
@@ -229,7 +231,10 @@ func parseEnvBool(name string, def bool) bool {
 }
 func clientIP(r *http.Request, trustProxy bool) string {
 	if trustProxy {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// Join every header line: a proxy may append its own line instead of
+		// extending the first one, and Header.Get would then return only the
+		// client-controlled line.
+		if xff := strings.Join(r.Header.Values("X-Forwarded-For"), ","); xff != "" {
 			parts := strings.Split(xff, ",")
 			for i := len(parts) - 1; i >= 0; i-- {
 				if ip := net.ParseIP(strings.TrimSpace(parts[i])); ip != nil {
@@ -277,19 +282,24 @@ func writeGatewayError(w http.ResponseWriter, code int, msg string) {
 }
 func decodeDoHQuery(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	if r.Method == http.MethodGet {
+		// Reject oversized query strings before parsing them. The dns=
+		// parameter alone can never legitimately exceed the base64url
+		// encoding of the maximum DNS message, so a longer raw query is
+		// guaranteed to carry an oversized dns= value (or junk padding
+		// intended to make the gateway parse megabytes of query string).
+		if len(r.URL.RawQuery) > len("dns=")+base64.RawURLEncoding.EncodedLen(maxDNSBody) {
+			return nil, errDNSMessageTooLarge
+		}
+		// The raw-query bound above already caps the dns= value at the
+		// encoded size of maxDNSBody, so the decoded message cannot exceed
+		// maxDNSBody either.
 		encoded := r.URL.Query().Get("dns")
 		if encoded == "" {
 			return nil, errMissingDNSParameter
 		}
-		if len(encoded) > base64.RawURLEncoding.EncodedLen(maxDNSBody) {
-			return nil, errDNSMessageTooLarge
-		}
 		decoded, err := base64.RawURLEncoding.DecodeString(encoded)
 		if err != nil {
 			return nil, errInvalidDNSParameter
-		}
-		if len(decoded) > maxDNSBody {
-			return nil, errDNSMessageTooLarge
 		}
 		return decoded, nil
 	}
@@ -530,21 +540,6 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	ip := clientIP(r, s.trustProxy)
-	now := time.Now()
-	switch s.limiter.check(ip, now) {
-	case limitAllowed:
-	case limitRateLimited:
-		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(s.limiter.retryAfter(ip, now))))
-		writeGatewayError(w, http.StatusTooManyRequests, "rate limit exceeded")
-		return
-	default: 
-		if n, ok := s.capacityLog.allow(now); ok {
-			log.Printf("client limiter at capacity (%d states); rejecting new clients%s", s.limiter.maxClients, suppressedNote(n))
-		}
-		writeGatewayError(w, http.StatusServiceUnavailable, "server busy")
-		return
-	}
 	query, err := decodeDoHQuery(w, r)
 	if err != nil {
 		if errors.Is(err, errInvalidContentType) {
@@ -566,6 +561,24 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	case s.concurrent <- struct{}{}:
 		defer func() { <-s.concurrent }()
 	default:
+		writeGatewayError(w, http.StatusServiceUnavailable, "server busy")
+		return
+	}
+	// The rate-limit budget is charged only after the request has passed
+	// body validation and the concurrency gate, so malformed or
+	// over-capacity requests never consume a client's window.
+	ip := clientIP(r, s.trustProxy)
+	now := time.Now()
+	switch s.limiter.check(ip, now) {
+	case limitAllowed:
+	case limitRateLimited:
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(s.limiter.retryAfter(ip, now))))
+		writeGatewayError(w, http.StatusTooManyRequests, "rate limit exceeded")
+		return
+	default:
+		if n, ok := s.capacityLog.allow(now); ok {
+			log.Printf("client limiter at capacity (%d states); rejecting new clients%s", s.limiter.maxClients, suppressedNote(n))
+		}
 		writeGatewayError(w, http.StatusServiceUnavailable, "server busy")
 		return
 	}
@@ -653,8 +666,8 @@ func main() {
 	defer cancel()
 	go lim.cleanup(ctx)
 	transport := &http.Transport{
-		MaxIdleConns:           16,
-		MaxIdleConnsPerHost:    16,
+		MaxIdleConns:           maxConcurrent,
+		MaxIdleConnsPerHost:    maxConcurrent,
 		MaxConnsPerHost:        maxConcurrent,
 		IdleConnTimeout:        30 * time.Second,
 		DisableCompression:     true,

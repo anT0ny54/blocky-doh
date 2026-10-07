@@ -1,10 +1,19 @@
 #!/bin/sh
 set -eu
+
 BLOCKY_PID=0
 GATEWAY_PID=0
-STATUS_DIR=$(mktemp -d)
+SHUTDOWN_DONE=0
+
+# Deterministic status directory: stale directories left behind by
+# previously SIGKILLed containers are removed before ours is created.
+STATUS_ROOT="${TMPDIR:-/tmp}"
+rm -rf "$STATUS_ROOT"/doh-gateway-status.* 2>/dev/null || :
+STATUS_DIR="$STATUS_ROOT/doh-gateway-status.$$"
+( umask 077 && mkdir -p "$STATUS_DIR" )
 BLOCKY_STATUS="$STATUS_DIR/blocky"
 GATEWAY_STATUS="$STATUS_DIR/gateway"
+
 run_supervised() {
   status_file=$1
   shift
@@ -25,7 +34,15 @@ run_supervised() {
   printf '%s\n' "$status" > "$status_file"
   exit "$status"
 }
+
 shutdown() {
+  # Idempotent: the INT/TERM handler and the EXIT trap can race, and a
+  # normal child exit also routes through here; after the first run this
+  # is a no-op instead of re-signalling already-reaped PIDs.
+  if [ "$SHUTDOWN_DONE" -eq 1 ]; then
+    return 0
+  fi
+  SHUTDOWN_DONE=1
   trap - EXIT
   trap '' INT TERM
   set +e
@@ -39,16 +56,20 @@ shutdown() {
   fi
   rm -rf "$STATUS_DIR"
 }
+
 on_signal() {
   shutdown
   exit 0
 }
+
 trap on_signal INT TERM
 trap shutdown EXIT
+
 run_supervised "$BLOCKY_STATUS" /blocky --config /etc/blocky/config.yml &
 BLOCKY_PID=$!
 run_supervised "$GATEWAY_STATUS" /doh-gateway &
 GATEWAY_PID=$!
+
 status=0
 while :; do
   if [ -s "$BLOCKY_STATUS" ]; then

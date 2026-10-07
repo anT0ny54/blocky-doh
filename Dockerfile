@@ -1,9 +1,7 @@
 ARG BLOCKY_VERSION=v0.35.0
 FROM golang:1.27.1-alpine AS builder
 RUN apk add --no-cache \
-        coreutils \
         git \
-        libcap \
         make
 ENV CGO_ENABLED=0 \
     GOTOOLCHAIN=local \
@@ -45,13 +43,12 @@ ENV GOMAXPROCS=1 \
     RATE_LIMIT=99 \
     MAX_CLIENTS=256 \
     MAX_CONCURRENT=16 \
-    TRUST_PROXY=true \
-    BLOCKY_CONFIG_FILE=/etc/blocky/config.yml
+    TRUST_PROXY=true
 HEALTHCHECK --interval=30s \
     --timeout=3s \
     --start-period=5s \
     --retries=3 \
-    CMD wget -q -O /dev/null \
-        "http://127.0.0.1:${PORT:-8080}/healthz" || exit 1
+    CMD p="${PORT:-8080}"; \
+        wget -q -O /dev/null "http://127.0.0.1:${p#:}/healthz" || exit 1
 USER app:app
 ENTRYPOINT ["/entrypoint.sh"]
