@@ -18,7 +18,7 @@ upstreams:
       - https://wurzn.hagezi.org/dns-query
       - https://juuri.hagezi.org/dns-query
 ports:
-  dns: []
+  dns: 127.0.0.1:1053
   http: 127.0.0.1:8053
 caching:
   maxItemsCount: 32768
