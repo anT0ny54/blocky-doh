@@ -928,12 +928,14 @@ func TestDoHInvalidRequestsDoNotConsumeRateBudget(t *testing.T) {
 }
 
 func TestLimiterRefreshesSeenOnRateLimitedRequests(t *testing.T) {
-	l := newLimiter(1, time.Minute, 2)
+	// The window (5m) outlasts the idle TTL (2m) so the second request is
+	// still rate limited when it arrives after the TTL.
+	l := newLimiter(1, 5*time.Minute, 2)
 	now := time.Unix(7_000_000, 0)
 	if got := l.check("198.51.100.1", now); got != limitAllowed {
 		t.Fatalf("first request got %v; want allowed", got)
 	}
-	rejected := now.Add(90 * time.Second) // past the 2-minute idle TTL
+	rejected := now.Add(150 * time.Second) // past the 2-minute idle TTL
 	if got := l.check("198.51.100.1", rejected); got != limitRateLimited {
 		t.Fatalf("second request got %v; want rate limited", got)
 	}
@@ -943,14 +945,18 @@ func TestLimiterRefreshesSeenOnRateLimitedRequests(t *testing.T) {
 }
 
 func TestLimiterKeepsPersistentlyRateLimitedClientAtCapacity(t *testing.T) {
-	l := newLimiter(1, time.Minute, 1)
+	// A 10-minute window keeps the first timestamp live for the whole test.
+	l := newLimiter(1, 10*time.Minute, 1)
 	start := time.Unix(8_000_000, 0)
 	if got := l.check("198.51.100.1", start); got != limitAllowed {
 		t.Fatalf("first request got %v; want allowed", got)
 	}
 	last := start
-	for i := 0; i < 6; i++ { // 20s steps keep the 60s window non-empty
-		last = last.Add(20 * time.Second)
+	// Six 30s steps end 180s after the first request, beyond the 2-minute idle
+	// TTL, so the client would be evictable had its seen time not been
+	// refreshed by the rejected requests.
+	for i := 0; i < 6; i++ {
+		last = last.Add(30 * time.Second)
 		if got := l.check("198.51.100.1", last); got != limitRateLimited {
 			t.Fatalf("follow-up request %d got %v; want rate limited", i+2, got)
 		}
