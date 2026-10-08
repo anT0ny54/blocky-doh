@@ -34,16 +34,18 @@ const (
 	defaultBackendURL     = "http://" + defaultBackendAddr + "/dns-query"
 	defaultRate           = 99
 	defaultWindow         = 60 * time.Second
-	defaultMaxClients     = 256
-	defaultMaxConcurrent  = 16
+	defaultMaxClients     = 8192
+	defaultMaxConcurrent  = 8
 	maxRateLimit          = 256
-	maxLimiterClients     = 1024
-	maxDNSBody            = 65535
+	maxLimiterClients     = 32768
+	maxDNSBody            = 8192
 	maxDNSResourceRecords = 4096
 	clientIdleTTL         = 2 * time.Minute
 	maxDNSNameHops        = 255
 	maxDNSNameLength      = 255
 	maxHeaderBytes        = 16 << 10
+	healthProbeTimeout    = 250 * time.Millisecond
+	healthProbeCacheTTL   = 2 * time.Second
 	evictInterval         = time.Second
 	logInterval           = 10 * time.Second
 )
@@ -58,8 +60,8 @@ const (
 
 type clientState struct {
 	mu    sync.Mutex
-	times []time.Time
-	seen  time.Time
+	times []int64
+	seen  int64
 }
 type limiter struct {
 	mu         sync.RWMutex
@@ -87,7 +89,7 @@ func newLimiter(rate int, window time.Duration, maxClients int) *limiter {
 	}
 }
 func (l *limiter) check(ip string, now time.Time) limitResult {
-	cutoff := now.Add(-l.window)
+	cutoff := now.Add(-l.window).UnixNano()
 	l.mu.Lock()
 	if l.clients == nil {
 		l.clients = make(map[string]*clientState)
@@ -111,7 +113,7 @@ func (l *limiter) check(ip string, now time.Time) limitResult {
 	l.mu.Unlock()
 	kept := state.times[:0]
 	for _, t := range state.times {
-		if t.After(cutoff) {
+		if t > cutoff {
 			kept = append(kept, t)
 		}
 	}
@@ -119,20 +121,20 @@ func (l *limiter) check(ip string, now time.Time) limitResult {
 	// Refresh liveness for every request, including rejected ones, so a
 	// persistently rate-limited client is not evicted as "idle" while it
 	// is still actively (if unsuccessfully) reaching the gateway.
-	state.seen = now
+	state.seen = now.UnixNano()
 	if len(state.times) >= l.rate {
 		state.mu.Unlock()
 		return limitRateLimited
 	}
-	state.times = append(state.times, now)
+	state.times = append(state.times, now.UnixNano())
 	state.mu.Unlock()
 	return limitAllowed
 }
 func (l *limiter) evictStaleLocked(now time.Time) {
-	cutoff := now.Add(-clientIdleTTL)
+	cutoff := now.Add(-clientIdleTTL).UnixNano()
 	for ip, state := range l.clients {
 		state.mu.Lock()
-		stale := state.seen.Before(cutoff)
+		stale := state.seen == 0 || state.seen < cutoff
 		state.mu.Unlock()
 		if stale {
 			delete(l.clients, ip)
@@ -152,7 +154,7 @@ func (l *limiter) retryAfter(ip string, now time.Time) time.Duration {
 	if len(state.times) == 0 {
 		return time.Second
 	}
-	if wait := state.times[0].Add(l.window).Sub(now); wait > time.Second {
+	if wait := time.Unix(0, state.times[0]).Add(l.window).Sub(now); wait > time.Second {
 		return wait
 	}
 	return time.Second
@@ -213,6 +215,12 @@ type server struct {
 	trustProxy  bool
 	capacityLog logGate
 	upstreamLog logGate
+
+	// Cached readiness probe so a public health endpoint cannot force a TCP
+	// dial on every request.
+	probeMu sync.Mutex
+	probeAt time.Time
+	probeOK bool
 }
 
 func parseEnvInt(name string, def, upper int) int {
@@ -241,45 +249,65 @@ func parseEnvBool(name string, def bool) bool {
 	}
 }
 func clientIP(r *http.Request, trustProxy bool) string {
+	parse := func(value string) string {
+		ip := net.ParseIP(strings.Trim(strings.TrimSpace(value), "[]"))
+		if ip == nil {
+			return ""
+		}
+		return ip.String()
+	}
 	if trustProxy {
-		// Join every header line: a proxy may append its own line instead of
-		// extending the first one, and Header.Get would then return only the
-		// client-controlled line.
+		// Prefer the header that trusted edges use to carry the original client
+		// address. X-Forwarded-For is then interpreted using its conventional
+		// left-most client address rather than the proxy's right-most address.
+		if ip := parse(r.Header.Get("CF-Connecting-IP")); ip != "" {
+			return ip
+		}
 		if xff := strings.Join(r.Header.Values("X-Forwarded-For"), ","); xff != "" {
-			parts := strings.Split(xff, ",")
-			for i := len(parts) - 1; i >= 0; i-- {
-				if ip := net.ParseIP(strings.TrimSpace(parts[i])); ip != nil {
-					return ip.String()
+			for _, part := range strings.Split(xff, ",") {
+				if ip := parse(part); ip != "" {
+					return ip
 				}
 			}
 		}
-		if rip := strings.TrimSpace(r.Header.Get("X-Real-IP")); rip != "" {
-			if ip := net.ParseIP(rip); ip != nil {
-				return ip.String()
-			}
+		if ip := parse(r.Header.Get("X-Real-IP")); ip != "" {
+			return ip
 		}
 	}
 	host := strings.TrimSpace(r.RemoteAddr)
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
-	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
-		return ip.String()
+	if ip := parse(host); ip != "" {
+		return ip
 	}
 	return host
 }
+func (s *server) backendReady() bool {
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	if time.Since(s.probeAt) < healthProbeCacheTTL {
+		return s.probeOK
+	}
+	conn, err := net.DialTimeout("tcp", s.backendAddr, healthProbeTimeout)
+	s.probeAt = time.Now()
+	s.probeOK = err == nil
+	if err == nil {
+		_ = conn.Close()
+	}
+	return s.probeOK
+}
+
 func (s *server) health(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		writeGatewayError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	conn, err := net.DialTimeout("tcp", s.backendAddr, 250*time.Millisecond)
-	if err != nil {
+	if !s.backendReady() {
 		writeGatewayError(w, http.StatusServiceUnavailable, "dns backend unavailable")
 		return
 	}
-	_ = conn.Close()
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -512,6 +540,13 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	select {
+	case s.concurrent <- struct{}{}:
+		defer func() { <-s.concurrent }()
+	default:
+		writeGatewayError(w, http.StatusServiceUnavailable, "server busy")
+		return
+	}
 	query, err := decodeDoHQuery(w, r)
 	if err != nil {
 		if errors.Is(err, errInvalidContentType) {
@@ -529,16 +564,7 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, http.StatusBadRequest, "invalid dns message")
 		return
 	}
-	select {
-	case s.concurrent <- struct{}{}:
-		defer func() { <-s.concurrent }()
-	default:
-		writeGatewayError(w, http.StatusServiceUnavailable, "server busy")
-		return
-	}
-	// The rate-limit budget is charged only after the request has passed
-	// body validation and the concurrency gate, so malformed or
-	// over-capacity requests never consume a client's window.
+	// The rate-limit budget is charged only after body validation, so malformed requests do not consume a client's window; the concurrency gate above still bounds body parsing and upstream work.
 	ip := clientIP(r, s.trustProxy)
 	now := time.Now()
 	switch s.limiter.check(ip, now) {

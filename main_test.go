@@ -57,6 +57,20 @@ func postDoH(s *server, query []byte, remoteAddr string) *httptest.ResponseRecor
 	s.handleDoH(rec, req)
 	return rec
 }
+
+type trackingBody struct {
+	read bool
+}
+
+func (b *trackingBody) Read(_ []byte) (int, error) {
+	b.read = true
+	return 0, io.EOF
+}
+
+func (b *trackingBody) Close() error {
+	return nil
+}
+
 func TestLimiterAllows99ThenRejects100thImmediateRequest(t *testing.T) {
 	l := newLimiter(99, 60*time.Second, 1024)
 	now := time.Unix(1_000_000, 0)
@@ -189,7 +203,7 @@ func TestLimiterThrottlesEvictionScans(t *testing.T) {
 	now := time.Unix(6_000_000, 0)
 	stale := now.Add(-clientIdleTTL - time.Second)
 	l.clients = map[string]*clientState{
-		"198.51.100.1": {times: []time.Time{stale}, seen: stale},
+		"198.51.100.1": {times: []int64{stale.UnixNano()}, seen: stale.UnixNano()},
 	}
 	l.lastEvict = now
 	if got := l.check("198.51.100.2", now.Add(500*time.Millisecond)); got != limitCapacity {
@@ -236,8 +250,8 @@ func TestLimiterEvictsStaleStateAtCapacity(t *testing.T) {
 	now := time.Now()
 	stale := now.Add(-clientIdleTTL - time.Second)
 	l.clients = map[string]*clientState{
-		"198.51.100.1": {times: []time.Time{stale}, seen: stale},
-		"198.51.100.2": {times: []time.Time{now}, seen: now},
+		"198.51.100.1": {times: []int64{stale.UnixNano()}, seen: stale.UnixNano()},
+		"198.51.100.2": {times: []int64{now.UnixNano()}, seen: now.UnixNano()},
 	}
 	if got := l.check("198.51.100.3", now); got != limitAllowed {
 		t.Fatalf("new client got %v; want allowed after stale-state eviction", got)
@@ -576,6 +590,28 @@ func TestDoHConcurrencyLimitReturns503(t *testing.T) {
 		t.Fatalf("first request status=%d; want 200, body=%q", first.Code, first.Body.String())
 	}
 }
+func TestDoHConcurrencyGateRejectsBeforeReadingBody(t *testing.T) {
+	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("backend must not be reached while the concurrency gate is full")
+	})
+	defer cleanup()
+	for i := 0; i < cap(s.concurrent); i++ {
+		s.concurrent <- struct{}{}
+	}
+	body := &trackingBody{}
+	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/dns-query", nil)
+	req.Body = body
+	req.Header.Set("Content-Type", "application/dns-message")
+	rec := httptest.NewRecorder()
+	s.handleDoH(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d; want 503", rec.Code)
+	}
+	if body.read {
+		t.Fatal("request body was read while concurrency gate was full")
+	}
+}
+
 func TestDoHRejectsOversizedGET(t *testing.T) {
 	backendCalls := 0
 	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -817,23 +853,52 @@ func TestGatewayHealthRequiresBackend(t *testing.T) {
 		t.Fatalf("health status=%d; want 503", rec.Code)
 	}
 }
-func TestClientIPUsesRightmostValidForwardedAddress(t *testing.T) {
+func TestGatewayHealthProbeIsCached(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{backendAddr: ln.Addr().String()}
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
+	rec := httptest.NewRecorder()
+	s.health(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first health status=%d; want 200", rec.Code)
+	}
+	_ = ln.Close()
+	rec = httptest.NewRecorder()
+	s.health(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cached health status=%d; want 200", rec.Code)
+	}
+}
+
+func TestClientIPUsesFirstValidForwardedAddress(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
 	req.RemoteAddr = "192.0.2.10:1234"
 	req.Header.Set("X-Forwarded-For", "198.51.100.7, unknown, 203.0.113.9")
-	if got := clientIP(req, true); got != "203.0.113.9" {
-		t.Fatalf("clientIP=%q; want 203.0.113.9", got)
+	if got := clientIP(req, true); got != "198.51.100.7" {
+		t.Fatalf("clientIP=%q; want 198.51.100.7", got)
 	}
 }
-func TestClientIPUsesRightmostAcrossMultipleForwardedHeaders(t *testing.T) {
+func TestClientIPUsesFirstAcrossMultipleForwardedHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
 	req.RemoteAddr = "192.0.2.10:1234"
-	// A client-supplied header line followed by a separate line appended by
-	// the trusted proxy: the proxy's (rightmost) address must win.
+	// The trusted proxy is expected to sanitize/overwrite X-Forwarded-For.
+	// The first forwarded address is treated as the client identity.
 	req.Header.Add("X-Forwarded-For", "198.51.100.7")
 	req.Header.Add("X-Forwarded-For", "203.0.113.9")
-	if got := clientIP(req, true); got != "203.0.113.9" {
-		t.Fatalf("clientIP=%q; want 203.0.113.9", got)
+	if got := clientIP(req, true); got != "198.51.100.7" {
+		t.Fatalf("clientIP=%q; want 198.51.100.7", got)
+	}
+}
+func TestClientIPPrefersCloudflareConnectingIP(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
+	req.RemoteAddr = "192.0.2.10:1234"
+	req.Header.Set("CF-Connecting-IP", "198.51.100.8")
+	req.Header.Set("X-Forwarded-For", "198.51.100.7, 203.0.113.9")
+	if got := clientIP(req, true); got != "198.51.100.8" {
+		t.Fatalf("clientIP=%q; want 198.51.100.8", got)
 	}
 }
 func TestClientIPNormalizesIPv6(t *testing.T) {
@@ -963,8 +1028,8 @@ func TestLimiterRefreshesSeenOnRateLimitedRequests(t *testing.T) {
 	if got := l.check("198.51.100.1", rejected); got != limitRateLimited {
 		t.Fatalf("second request got %v; want rate limited", got)
 	}
-	if got := l.clients["198.51.100.1"].seen; !got.Equal(rejected) {
-		t.Fatalf("seen=%v; want %v refreshed by the rejected request", got, rejected)
+	if got := l.clients["198.51.100.1"].seen; got != rejected.UnixNano() {
+		t.Fatalf("seen=%v; want %v refreshed by the rejected request", time.Unix(0, got), rejected)
 	}
 }
 

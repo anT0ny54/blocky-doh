@@ -70,7 +70,7 @@ This validation is primarily a resource-safety and protocol-correctness guard; i
 
 ### Request order and status codes
 
-`/dns-query` requests are checked in this order, and the first failing check decides the response: HTTP method, then body/query decoding and size, then DNS wire-format validation, then the concurrency gate, then the per-client rate limiter, and finally the backend call. Because the rate budget is charged only at the last gate, every rejection before it is free for the client.
+`/dns-query` requests are checked in this order, and the first failing check decides the response: HTTP method, then the concurrency gate, then body/query decoding and size, then DNS wire-format validation, then the per-client rate limiter, and finally the backend call. The concurrency gate is intentionally before parsing so malformed or oversized request floods cannot consume unbounded CPU or memory outside the configured in-flight budget. The rate budget is charged only after DNS validation, so malformed requests do not consume a client window.
 
 | Status | When |
 |---|---|
@@ -78,7 +78,7 @@ This validation is primarily a resource-safety and protocol-correctness guard; i
 | `204` | `OPTIONS` preflight on `/dns-query`. |
 | `400` | GET without `dns=`, padded or otherwise invalid base64url, unreadable POST body, or a message that fails DNS structural validation. |
 | `405` | Method not allowed (`Allow` header is set). |
-| `413` | GET query string over the 87,384-character bound, or POST body over 65,535 bytes. |
+| `413` | GET query string over the 10,927-character bound, or POST body over 8,192 bytes. |
 | `415` | POST whose `Content-Type` is not `application/dns-message` (parameters such as `charset` are accepted). |
 | `429` | Client exceeded its sliding window; `Retry-After` is 1–60 seconds. |
 | `500` | The gateway could not build the backend request. |
@@ -90,13 +90,13 @@ All gateway-generated error responses are plain text with `Cache-Control: no-sto
 
 ### Known limitations
 
-- Rate limiting is per exact client address. IPv6 clients are not grouped by prefix, so one host with a routed `/64` can rotate source addresses to obtain additional windows and, because the client table is bounded by `MAX_CLIENTS`, can crowd out new clients with `503`.
-- `/healthz` is public and is not covered by the rate limiter or the concurrency gate; each request costs one loopback TCP connect of up to 250 ms.
+- Rate limiting is per exact client IP. IPv6 addresses are intentionally not grouped by prefix in this gateway, so a subscriber that can rotate source addresses inside a routed `/64` can obtain additional windows. The bounded client table is designed to cap memory rather than provide a perfect identity system.
+- `/healthz` is public and is not covered by the rate limiter or the DoH concurrency gate. Its loopback readiness probe is cached for 2 seconds, so repeated health checks do not create a TCP connection storm.
 - With `TRUST_PROXY=true`, a request that carries no valid `X-Forwarded-For` or `X-Real-IP` value is attributed to its TCP peer, which behind a load balancer is the load balancer itself.
 
 ## Important client-IP setting
 
-`TRUST_PROXY=true` is enabled because SnapDeploy routes traffic through its managed load balancer. The gateway uses the rightmost valid address in `X-Forwarded-For` (all `X-Forwarded-For` header lines are considered, so a proxy that appends a separate header line instead of extending the first one cannot be bypassed by a client-supplied line), then `X-Real-IP`, and otherwise falls back to the TCP peer address. This matches the usual append-style proxy chain and avoids trusting a client-prepended spoofed address. If more than one trusted proxy sits in front of the gateway, the rightmost address is the nearest proxy, not the end client.
+`TRUST_PROXY=true` is enabled in the production image for the intended SnapDeploy edge deployment. The gateway first uses `CF-Connecting-IP`, then the first valid address in `X-Forwarded-For`, then `X-Real-IP`, and otherwise falls back to the TCP peer address. The trusted edge must overwrite/sanitize these headers before forwarding; do not enable proxy-header trust on a directly reachable port. This keeps one stable client-IP key when the platform supplies the original address.
 
 For a direct local/container test without a trusted proxy, set `TRUST_PROXY=false`. Invalid `TRUST_PROXY` values fall back to the safe default (`false`). The Dockerfile's production `ENV` defaults to `true` because SnapDeploy's load balancer is the trusted proxy in that path.
 
@@ -112,11 +112,11 @@ Environment variables read by the gateway. Unset, empty, non-numeric, below-1 or
 |---|---|---|---|
 | `PORT` | `8080` | TCP port number | Public listener port (a leading `:` is accepted). The value is not range-checked; an unusable value makes the gateway exit at startup. |
 | `RATE_LIMIT` | `99` | 1–256 | Requests per client IP per 60-second sliding window. The window length is fixed. |
-| `MAX_CLIENTS` | `256` | 1–1024 | Maximum client rate-limit states held in memory. |
-| `MAX_CONCURRENT` | `16` | 1–16 | Maximum in-flight DNS requests and backend connections. 16 is both the default and the hard cap, so the value can only be lowered. |
+| `MAX_CLIENTS` | `8192` | 1–32768 | Maximum client rate-limit states held in memory. |
+| `MAX_CONCURRENT` | `8` | 1–8 | Maximum in-flight DNS requests, including body parsing and backend connections. 8 is the hard cap for this image. |
 | `TRUST_PROXY` | `false` in the binary, `true` in the Docker image | `true`/`false` (case-insensitive) | Use `X-Forwarded-For`/`X-Real-IP` for client identity. |
 
-The Dockerfile's `ENV` sets `GOMAXPROCS=1`, `RATE_LIMIT=99`, `MAX_CLIENTS=256`, `MAX_CONCURRENT=16` and `TRUST_PROXY=true`.
+The Dockerfile's `ENV` sets `GOMAXPROCS=1`, `GOGC=100`, `GOMEMLIMIT=160MiB`, `RATE_LIMIT=99`, `MAX_CLIENTS=8192`, `MAX_CONCURRENT=8` and `TRUST_PROXY=true`.
 
 The Blocky backend address (`127.0.0.1:8053`) is fixed in the gateway and must match `ports.http` in `config.yml`. The Blocky config path (`/etc/blocky/config.yml`) is fixed in `entrypoint.sh`.
 
@@ -125,12 +125,12 @@ The Blocky backend address (`127.0.0.1:8053`) is fixed in the gateway and must m
 The default values are chosen for the Small tier:
 
 - `GOMAXPROCS=1` — matches the Go runtime's scheduler/GC thread count to the tier's 0.25 vCPU quota instead of the host's full core count. The Dockerfile sets it for the whole container, so it applies to the Blocky process as well as the gateway.
-- `MAX_CONCURRENT=16` — bounds in-flight DNS work and prevents request floods from consuming all memory/CPU. Requests beyond the limit receive `503` immediately.
-- `MAX_CLIENTS=256` — hard cap on in-memory rate-limit client states; the limiter map is allocated only when the first request arrives. When the table is full, new clients receive `503` and the event is logged, while over-budget clients receive `429`. Because idle states are only reclaimed after 2 minutes, the service can track at most `MAX_CLIENTS` distinct client IPs per 2-minute period; raise it (up to 1024) for busier deployments.
-- `caching.maxItemsCount=32768` — bounded Blocky cache; Blocky documents this option specifically as useful on systems with limited RAM. `caching.cacheTimeNegative=5m` caches negative answers for five minutes.
+- `MAX_CONCURRENT=8` — bounds both request parsing and backend DNS work, which is a better fit for 0.25 vCPU. Requests beyond the limit receive `503` immediately.
+- `MAX_CLIENTS=8192` — hard cap on in-memory rate-limit client states; the limiter map is allocated only when the first request arrives. When the table is full, new clients receive `503` and the event is logged, while over-budget clients receive `429`. Idle states are reclaimed after 2 minutes, so this gives headroom for thousands of active client IPs without allowing unbounded map growth.
+- `caching.maxItemsCount=16384` — bounded Blocky cache; this halves cache metadata versus 32,768 entries and leaves more headroom for the gateway, TLS, and Go runtime under a 512 MB container. `caching.cacheTimeNegative=5m` caches negative answers for five minutes.
 - `upstreams.strategy=random` — one upstream request per cache miss in the normal path; this avoids the extra upstream fan-out of `parallel_best` and is a better fit for 0.25 vCPU.
 - `upstreams.timeout=1200ms` — keeps each failed upstream attempt below the gateway's 3-second request deadline and leaves room for fallback.
-- Backend HTTP response headers are capped at 16 KiB and redirects are disabled to keep the loopback-only backend path bounded and non-redirecting. The gateway's backend request deadline is 3 seconds, with a 2.5-second response-header timeout; both timeouts surface as `504`, while other backend failures surface as `502`.
+- Backend HTTP response headers are capped at 16 KiB and redirects are disabled to keep the loopback-only backend path bounded and non-redirecting. The gateway's backend request deadline is 3 seconds, with a 2.5-second response-header timeout; both timeouts surface as `504`, while other backend failures surface as `502`. `/healthz` uses a separate 250 ms loopback probe cached for 2 seconds.
 - `connectIPVersion=v4` — avoids unnecessary IPv6 connection attempts for the supplied upstream configuration.
 - `queryLog.type=none` — query logging is explicitly disabled. Blocky's own default when `queryLog.type` is unset is `console`, which builds a log entry for every query even if `log.level=warn` then discards the line; `none` makes Blocky skip that per-query work. Prometheus metrics (off by default), prefetching (`prefetching: false`) and blocklists (no `blocking` section) are likewise disabled; blocking is performed by the HaGeZi upstreams, not by Blocky. Blocky's REST API and pprof endpoints exist on its loopback HTTP listener but are not reachable through the gateway.
 - Blocky's default `upstreams.init.strategy` (`blocking`) is left unchanged.

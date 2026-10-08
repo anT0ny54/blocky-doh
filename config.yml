@@ -21,7 +21,7 @@ ports:
   dns: 127.0.0.1:5353
   http: 127.0.0.1:8053
 caching:
-  maxItemsCount: 32768
+  maxItemsCount: 16384
   prefetching: false
   cacheTimeNegative: 5m
 # Blocky's default when queryLog.type is unset is "console", which builds a log
