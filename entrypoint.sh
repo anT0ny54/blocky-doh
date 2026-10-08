@@ -80,6 +80,11 @@ while :; do
     status=$(cat "$GATEWAY_STATUS")
     break
   fi
-  sleep 1
+  # Wait on a background sleep instead of running it in the foreground: the
+  # shell defers trap handlers until a foreground command finishes, so a plain
+  # `sleep 1` delayed INT/TERM handling by up to a second. `wait` returns as
+  # soon as a trapped signal arrives.
+  sleep 1 &
+  wait "$!" 2>/dev/null || :
 done
 exit "$status"

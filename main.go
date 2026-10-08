@@ -1,4 +1,5 @@
 package main
+
 import (
 	"bytes"
 	"context"
@@ -18,6 +19,7 @@ import (
 	"syscall"
 	"time"
 )
+
 var (
 	errMissingDNSParameter = errors.New("missing dns parameter")
 	errInvalidDNSParameter = errors.New("invalid dns parameter")
@@ -25,10 +27,11 @@ var (
 	errInvalidContentType  = errors.New("invalid content type")
 	errFailedReadDNSBody   = errors.New("failed to read dns message")
 )
+
 const (
 	defaultPort           = "8080"
-	defaultBackendURL     = "http://127.0.0.1:8053/dns-query"
 	defaultBackendAddr    = "127.0.0.1:8053"
+	defaultBackendURL     = "http://" + defaultBackendAddr + "/dns-query"
 	defaultRate           = 99
 	defaultWindow         = 60 * time.Second
 	defaultMaxClients     = 256
@@ -44,25 +47,29 @@ const (
 	evictInterval         = time.Second
 	logInterval           = 10 * time.Second
 )
+
 type limitResult int
+
 const (
 	limitAllowed limitResult = iota
 	limitRateLimited
 	limitCapacity
 )
+
 type clientState struct {
 	mu    sync.Mutex
 	times []time.Time
 	seen  time.Time
 }
 type limiter struct {
-	mu         sync.Mutex
+	mu         sync.RWMutex
 	clients    map[string]*clientState
 	maxClients int
 	rate       int
 	window     time.Duration
 	lastEvict  time.Time
 }
+
 func newLimiter(rate int, window time.Duration, maxClients int) *limiter {
 	if rate < 1 {
 		rate = defaultRate
@@ -133,14 +140,14 @@ func (l *limiter) evictStaleLocked(now time.Time) {
 	}
 }
 func (l *limiter) retryAfter(ip string, now time.Time) time.Duration {
-	l.mu.Lock()
+	l.mu.RLock()
 	state := l.clients[ip]
 	if state == nil {
-		l.mu.Unlock()
+		l.mu.RUnlock()
 		return time.Second
 	}
 	state.mu.Lock()
-	l.mu.Unlock()
+	l.mu.RUnlock()
 	defer state.mu.Unlock()
 	if len(state.times) == 0 {
 		return time.Second
@@ -157,11 +164,13 @@ func retryAfterSeconds(d time.Duration) int {
 	}
 	return secs
 }
+
 type logGate struct {
 	mu         sync.Mutex
 	last       time.Time
 	suppressed int64
 }
+
 func (g *logGate) allow(now time.Time) (int64, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -194,6 +203,7 @@ func (l *limiter) cleanup(ctx context.Context) {
 		}
 	}
 }
+
 type server struct {
 	client      *http.Client
 	backendURL  string
@@ -204,13 +214,14 @@ type server struct {
 	capacityLog logGate
 	upstreamLog logGate
 }
-func parseEnvInt(name string, def, max int) int {
+
+func parseEnvInt(name string, def, upper int) int {
 	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
 		return def
 	}
 	n, err := strconv.Atoi(value)
-	if err != nil || n < 1 || n > max {
+	if err != nil || n < 1 || n > upper {
 		return def
 	}
 	return n
@@ -317,13 +328,18 @@ func decodeDoHQuery(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	}
 	return body, nil
 }
-func skipDNSName(message []byte, offset int) (int, error) {
+
+// walkDNSName follows the (possibly compressed) name starting at offset and
+// returns the offset of the first byte after it at its original position. When
+// out is non-nil the labels are appended to it, joined with dots. Compression
+// pointers must point strictly backwards and past the header, and both the
+// number of pointer hops and the expanded wire length are bounded.
+func walkDNSName(message []byte, offset int, out *strings.Builder) (int, error) {
 	if offset < 0 || offset >= len(message) {
 		return 0, errors.New("dns name offset out of bounds")
 	}
 	pos := offset
-	returnOffset := offset
-	jumped := false
+	next := -1
 	hops := 0
 	nameLen := 0
 	for {
@@ -340,9 +356,8 @@ func skipDNSName(message []byte, offset int) (int, error) {
 			if pointer < 12 || pointer >= len(message) || pointer >= pos {
 				return 0, errors.New("invalid dns compression pointer")
 			}
-			if !jumped {
-				returnOffset = pos + 2
-				jumped = true
+			if next < 0 {
+				next = pos + 2
 			}
 			hops++
 			if hops > maxDNSNameHops {
@@ -356,10 +371,10 @@ func skipDNSName(message []byte, offset int) (int, error) {
 				if nameLen > maxDNSNameLength {
 					return 0, errors.New("dns name too long")
 				}
-				if jumped {
-					return returnOffset, nil
+				if next < 0 {
+					next = pos
 				}
-				return pos, nil
+				return next, nil
 			}
 			if length > 63 {
 				return 0, errors.New("dns label too long")
@@ -371,67 +386,28 @@ func skipDNSName(message []byte, offset int) (int, error) {
 			if nameLen > maxDNSNameLength {
 				return 0, errors.New("dns name too long")
 			}
+			if out != nil {
+				if out.Len() > 0 {
+					out.WriteByte('.')
+				}
+				out.Write(message[pos : pos+length])
+			}
 			pos += length
 		default:
 			return 0, errors.New("invalid dns label type")
 		}
 	}
 }
+func skipDNSName(message []byte, offset int) (int, error) {
+	return walkDNSName(message, offset, nil)
+}
 func expandDNSName(message []byte, offset int) (string, int, error) {
 	var b strings.Builder
-	pos := offset
-	end := -1
-	jumped := false
-	hops := 0
-	for {
-		if pos >= len(message) {
-			return "", 0, errors.New("truncated dns name")
-		}
-		length := int(message[pos])
-		switch length & 0xc0 {
-		case 0xc0:
-			if pos+1 >= len(message) {
-				return "", 0, errors.New("truncated dns compression pointer")
-			}
-			pointer := ((length & 0x3f) << 8) | int(message[pos+1])
-			if pointer < 12 || pointer >= len(message) || pointer >= pos {
-				return "", 0, errors.New("invalid dns compression pointer")
-			}
-			if !jumped {
-				end = pos + 2
-				jumped = true
-			}
-			hops++
-			if hops > maxDNSNameHops {
-				return "", 0, errors.New("dns compression pointer loop")
-			}
-			pos = pointer
-		case 0x00:
-			pos++
-			if length == 0 {
-				if !jumped {
-					end = pos
-				}
-				return b.String(), end, nil
-			}
-			if length > 63 {
-				return "", 0, errors.New("dns label too long")
-			}
-			if pos+length > len(message) {
-				return "", 0, errors.New("truncated dns label")
-			}
-			if b.Len()+length > maxDNSNameLength {
-				return "", 0, errors.New("dns name too long")
-			}
-			if b.Len() > 0 {
-				b.WriteByte('.')
-			}
-			b.Write(message[pos : pos+length])
-			pos += length
-		default:
-			return "", 0, errors.New("invalid dns label type")
-		}
+	end, err := walkDNSName(message, offset, &b)
+	if err != nil {
+		return "", 0, err
 	}
+	return b.String(), end, nil
 }
 func dnsNameEqual(a, b string) bool {
 	if len(a) != len(b) {
@@ -481,42 +457,38 @@ func validateDNSMessage(message []byte, response bool) error {
 	if qdCount != 1 {
 		return errors.New("dns message must contain exactly one question")
 	}
-	if anCount+nsCount+arCount > maxDNSResourceRecords {
+	records := anCount + nsCount + arCount
+	if records > maxDNSResourceRecords {
 		return errors.New("dns resource record count exceeds limit")
 	}
-	minBytes := qdCount*5 + (anCount+nsCount+arCount)*11
-	if minBytes > len(message)-12 {
+	// Exactly one question (checked above) needs at least a root label byte
+	// plus 4 question bytes; every resource record needs at least a root
+	// label byte plus 10 fixed bytes.
+	if 5+records*11 > len(message)-12 {
 		return errors.New("dns section counts exceed message size")
 	}
-	offset := 12
-	for i := 0; i < qdCount; i++ {
-		var err error
+	offset, err := skipDNSName(message, 12)
+	if err != nil {
+		return err
+	}
+	if offset+4 > len(message) {
+		return errors.New("truncated dns question")
+	}
+	offset += 4
+	for i := 0; i < records; i++ {
 		offset, err = skipDNSName(message, offset)
 		if err != nil {
 			return err
 		}
-		if offset+4 > len(message) {
-			return errors.New("truncated dns question")
+		if offset+10 > len(message) {
+			return errors.New("truncated dns resource record")
 		}
-		offset += 4
-	}
-	for _, count := range []int{anCount, nsCount, arCount} {
-		for i := 0; i < count; i++ {
-			var err error
-			offset, err = skipDNSName(message, offset)
-			if err != nil {
-				return err
-			}
-			if offset+10 > len(message) {
-				return errors.New("truncated dns resource record")
-			}
-			rdLength := int(uint16(message[offset+8])<<8 | uint16(message[offset+9]))
-			offset += 10
-			if offset+rdLength > len(message) {
-				return errors.New("truncated dns rdata")
-			}
-			offset += rdLength
+		rdLength := int(uint16(message[offset+8])<<8 | uint16(message[offset+9]))
+		offset += 10
+		if offset+rdLength > len(message) {
+			return errors.New("truncated dns rdata")
 		}
+		offset += rdLength
 	}
 	if offset != len(message) {
 		return errors.New("trailing bytes after dns message")
@@ -599,7 +571,7 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		}
 		status := http.StatusBadGateway
 		var netErr net.Error
-		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+		if errors.As(err, &netErr) && netErr.Timeout() {
 			status = http.StatusGatewayTimeout
 		}
 		if n, ok := s.upstreamLog.allow(time.Now()); ok {
@@ -698,11 +670,11 @@ func main() {
 	}
 	log.Printf("DoH gateway listening on %s; rate=%d requests/%s sliding window; maxClients=%d; maxConcurrent=%d; trustProxy=%t", port, rate, defaultWindow, maxClients, maxConcurrent, trustProxy)
 	serveErr := make(chan error, 1)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		serveErr <- srv.ListenAndServe()
 	}()
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case err := <-serveErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {

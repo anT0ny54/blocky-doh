@@ -24,6 +24,11 @@ caching:
   maxItemsCount: 32768
   prefetching: false
   cacheTimeNegative: 5m
+# Blocky's default when queryLog.type is unset is "console", which builds a log
+# entry for every query even though log.level=warn then discards it. "none"
+# makes Blocky skip that per-query work entirely.
+queryLog:
+  type: none
 log:
   level: warn
   format: text

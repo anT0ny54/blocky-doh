@@ -1,4 +1,5 @@
 package main
+
 import (
 	"bytes"
 	"encoding/base64"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 )
+
 func testDNSQuery(id byte) []byte {
 	return []byte{
 		id, 0x34, 0x01, 0x00,
@@ -344,16 +346,38 @@ func TestValidateDNSMessageRejectsExpandedCompressedNameOver255Bytes(t *testing.
 	if len(longName) != 253 {
 		t.Fatalf("unexpected long name length=%d; want 253", len(longName))
 	}
-	message := []byte{
-		0x12, 0x34, 0x01, 0x00,
-		0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	// A response with one question (the 253-byte name) and one answer whose
+	// owner name is either a bare pointer back to the question name (253
+	// bytes expanded, valid) or "www" plus that pointer (257 bytes expanded,
+	// too long). The control case proves the rejection comes from the name
+	// length limit and not from some other malformed field.
+	build := func(owner []byte) []byte {
+		message := []byte{
+			0x12, 0x34, 0x81, 0x80,
+			0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+		}
+		message = append(message, longName...)
+		message = append(message, 0x00, 0x01, 0x00, 0x01)
+		message = append(message, owner...)
+		return append(message, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x00)
 	}
-	message = append(message, longName...)
-	message = append(message, 0x00, 0x01, 0x00, 0x01)
-	message = append(message, 0x03, 'w', 'w', 'w', 0xc0, 0x0c)
-	message = append(message, 0x00, 0x01, 0x00, 0x01)
-	if err := validateDNSMessage(message, false); err == nil {
+	if err := validateDNSMessage(build([]byte{0xc0, 0x0c}), true); err != nil {
+		t.Fatalf("answer owner expanding to 253 bytes rejected: %v", err)
+	}
+	if err := validateDNSMessage(build([]byte{0x03, 'w', 'w', 'w', 0xc0, 0x0c}), true); err == nil {
 		t.Fatal("expanded compressed DNS name over 255 bytes was accepted")
+	}
+}
+func TestExpandDNSNameRejectsOutOfBoundsOffset(t *testing.T) {
+	message := testDNSQuery(0x17)
+	for _, offset := range []int{-1, len(message), len(message) + 5} {
+		if _, _, err := expandDNSName(message, offset); err == nil {
+			t.Fatalf("expandDNSName accepted out-of-bounds offset %d", offset)
+		}
+	}
+	name, end, err := expandDNSName(message, 12)
+	if err != nil || name != "example.com" || end != 25 {
+		t.Fatalf("expandDNSName=%q,%d,%v; want example.com,25,nil", name, end, err)
 	}
 }
 func TestDNSQuestionEqual(t *testing.T) {

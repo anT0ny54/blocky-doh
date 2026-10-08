@@ -44,15 +44,15 @@ The `/dns-query` path is implemented by `doh-gateway`, which answers `OPTIONS` p
 5. Add your custom domain if the service is intended for public DoH clients. SnapDeploy terminates HTTPS and routes to the container.
 6. Use `/dns-query` as the DoH path.
 
-The Docker build compiles the gateway in a Go builder stage and runs `go vet` and `go test` there, so a failing test fails the build. The final Alpine image contains only the gateway binary, the Blocky binary, `config.yml`, `entrypoint.sh`, `ca-certificates`, and the BusyBox `wget` used by the health check, and runs as the unprivileged `app` user. The image health check (every 30 s, 3 s timeout, 5 s start period, 3 retries) requests `/healthz` on `$PORT` (default `8080`; a leading `:` in `PORT` is tolerated).
+The Docker build compiles the gateway in its own Go builder stage (`gateway-builder`) and runs `go vet` and `go test` there, so a failing test fails the build. The final Alpine image contains only the gateway binary, the Blocky binary, `config.yml`, `entrypoint.sh`, `ca-certificates`, and the BusyBox `wget` used by the health check, and runs as the unprivileged `app` user. The image health check (every 30 s, 3 s timeout, 5 s start period, 3 retries) requests `/healthz` on `$PORT` (default `8080`; a leading `:` in `PORT` is tolerated).
 
-The Blocky backend is compiled in the same builder stage: the Dockerfile clones the Blocky repository at the pinned `BLOCKY_VERSION` tag (`v0.35.0`) and builds it with `make build BIN_OUT_DIR=/bin`. The build requires network access to github.com for the clone step, so restricted build environments without outbound HTTPS to GitHub fail there with a `Failed to connect to github.com port 443`-style error.
+The Blocky backend is compiled in a separate builder stage (`blocky-builder`), so editing the gateway source never invalidates the cached Blocky clone/compile layers and BuildKit can build the two binaries in parallel. That stage clones the Blocky repository at the pinned `BLOCKY_VERSION` tag (`v0.35.0`, overridable with `--build-arg BLOCKY_VERSION=<tag>`) and builds it with `make build BIN_OUT_DIR=/bin`. The build requires network access to github.com for the clone step, so restricted build environments without outbound HTTPS to GitHub fail there with a `Failed to connect to github.com port 443`-style error.
 
 Example endpoint after a custom domain is attached:
 
 `https://dns.example.com/dns-query`
 
-The `/healthz` endpoint (`GET`/`HEAD`) returns `200` only when a TCP connection to Blocky's loopback listener (`127.0.0.1:8053`) succeeds within 250 ms, otherwise `503`. This lets the container health check catch a failed DNS backend rather than reporting the gateway as ready by itself. It is a connect check only, not a DNS query. Other paths are intentionally rejected with `404`.
+The `/healthz` endpoint (`GET`/`HEAD`) returns `200` only when a TCP connection to Blocky's loopback listener (`127.0.0.1:8053`) succeeds within 250 ms, otherwise `503`. This lets the container health check catch a failed DNS backend rather than reporting the gateway as ready by itself. It is a connect check only, not a DNS query. Methods other than `GET`/`HEAD` receive `405`. Other paths are intentionally rejected with `404`; the one exception is a non-canonical path such as `//dns-query` or `/a/../dns-query`, which Go's `http.ServeMux` answers with a `301` redirect to the cleaned path before routing.
 
 ## DoH handling and validation
 
@@ -68,6 +68,32 @@ The gateway accepts RFC-style DoH GET and POST requests on `/dns-query`:
 
 This validation is primarily a resource-safety and protocol-correctness guard; it does not replace DNSSEC validation or Blocky's resolver protections.
 
+### Request order and status codes
+
+`/dns-query` requests are checked in this order, and the first failing check decides the response: HTTP method, then body/query decoding and size, then DNS wire-format validation, then the concurrency gate, then the per-client rate limiter, and finally the backend call. Because the rate budget is charged only at the last gate, every rejection before it is free for the client.
+
+| Status | When |
+|---|---|
+| `200` | Valid, fully verified DNS response from Blocky (`application/dns-message`, `Cache-Control: no-store`, `Access-Control-Allow-Origin: *`). |
+| `204` | `OPTIONS` preflight on `/dns-query`. |
+| `400` | GET without `dns=`, padded or otherwise invalid base64url, unreadable POST body, or a message that fails DNS structural validation. |
+| `405` | Method not allowed (`Allow` header is set). |
+| `413` | GET query string over the 87,384-character bound, or POST body over 65,535 bytes. |
+| `415` | POST whose `Content-Type` is not `application/dns-message` (parameters such as `charset` are accepted). |
+| `429` | Client exceeded its sliding window; `Retry-After` is 1–60 seconds. |
+| `500` | The gateway could not build the backend request. |
+| `502` | Backend unreachable, or its response failed any verification check (status, content type, size, wire format, transaction ID, question echo). |
+| `503` | Concurrency limit reached, or the client table is full and the client is new. Also `/healthz` when Blocky's listener does not accept a connection. |
+| `504` | Backend request exceeded its 3-second deadline or 2.5-second response-header timeout. |
+
+All gateway-generated error responses are plain text with `Cache-Control: no-store`; they carry no CORS headers.
+
+### Known limitations
+
+- Rate limiting is per exact client address. IPv6 clients are not grouped by prefix, so one host with a routed `/64` can rotate source addresses to obtain additional windows and, because the client table is bounded by `MAX_CLIENTS`, can crowd out new clients with `503`.
+- `/healthz` is public and is not covered by the rate limiter or the concurrency gate; each request costs one loopback TCP connect of up to 250 ms.
+- With `TRUST_PROXY=true`, a request that carries no valid `X-Forwarded-For` or `X-Real-IP` value is attributed to its TCP peer, which behind a load balancer is the load balancer itself.
+
 ## Important client-IP setting
 
 `TRUST_PROXY=true` is enabled because SnapDeploy routes traffic through its managed load balancer. The gateway uses the rightmost valid address in `X-Forwarded-For` (all `X-Forwarded-For` header lines are considered, so a proxy that appends a separate header line instead of extending the first one cannot be bypassed by a client-supplied line), then `X-Real-IP`, and otherwise falls back to the TCP peer address. This matches the usual append-style proxy chain and avoids trusting a client-prepended spoofed address. If more than one trusted proxy sits in front of the gateway, the rightmost address is the nearest proxy, not the end client.
@@ -76,7 +102,7 @@ For a direct local/container test without a trusted proxy, set `TRUST_PROXY=fals
 
 ## Shutdown behavior
 
-On `SIGINT`/`SIGTERM`, the gateway stops accepting new connections and drains in-flight DoH requests via a graceful HTTP shutdown (up to 5 seconds) before exiting, rather than dropping active requests immediately. `entrypoint.sh` shuts down in order: it first sends `SIGTERM` to the gateway and waits for it to exit, and only then stops Blocky, so Blocky keeps answering while requests drain. If either process exits on its own, the entrypoint stops the other one and exits with the first process's status; a signal-initiated shutdown exits `0`. Neither process is given a startup delay: until Blocky is listening, `/healthz` returns `503` and DNS queries return `502`.
+On `SIGINT`/`SIGTERM`, the gateway stops accepting new connections and drains in-flight DoH requests via a graceful HTTP shutdown (up to 5 seconds) before exiting, rather than dropping active requests immediately. `entrypoint.sh` shuts down in order: it first sends `SIGTERM` to the gateway and waits for it to exit, and only then stops Blocky, so Blocky keeps answering while requests drain. If either process exits on its own, the entrypoint stops the other one and exits with the first process's status; a signal-initiated shutdown exits `0`. The entrypoint polls the two processes' exit status once per second, but does so by waiting on a background `sleep`, so `SIGINT`/`SIGTERM` are acted on immediately rather than after the current poll interval. Neither process is given a startup delay: until Blocky is listening, `/healthz` returns `503` and DNS queries return `502`.
 
 ## Configuration
 
@@ -106,7 +132,8 @@ The default values are chosen for the Small tier:
 - `upstreams.timeout=1200ms` — keeps each failed upstream attempt below the gateway's 3-second request deadline and leaves room for fallback.
 - Backend HTTP response headers are capped at 16 KiB and redirects are disabled to keep the loopback-only backend path bounded and non-redirecting. The gateway's backend request deadline is 3 seconds, with a 2.5-second response-header timeout; both timeouts surface as `504`, while other backend failures surface as `502`.
 - `connectIPVersion=v4` — avoids unnecessary IPv6 connection attempts for the supplied upstream configuration.
-- Query logging, Prometheus metrics, prefetching, and blocklists are disabled; blocking is performed by the HaGeZi upstreams, not by Blocky. Blocky's REST API and pprof endpoints exist on its loopback HTTP listener but are not reachable through the gateway.
+- `queryLog.type=none` — query logging is explicitly disabled. Blocky's own default when `queryLog.type` is unset is `console`, which builds a log entry for every query even if `log.level=warn` then discards the line; `none` makes Blocky skip that per-query work. Prometheus metrics (off by default), prefetching (`prefetching: false`) and blocklists (no `blocking` section) are likewise disabled; blocking is performed by the HaGeZi upstreams, not by Blocky. Blocky's REST API and pprof endpoints exist on its loopback HTTP listener but are not reachable through the gateway.
+- Blocky's default `upstreams.init.strategy` (`blocking`) is left unchanged.
 - Gateway observability is limited to startup, listen failure, shutdown-drain, backend transport failures (connection errors and timeouts, `502`/`504`), and rate-limiter capacity messages on the standard logger (stderr). The last two are throttled to at most one line per 10 seconds each, with a count of suppressed messages appended, so request floods cannot turn logging into a resource drain. Invalid-but-delivered upstream responses (`502`) and client disconnects are not logged.
 
 These are capacity-oriented defaults, not a guarantee of a fixed users-per-second number. Real capacity depends heavily on cache hit rate, DNS response sizes, upstream latency, and the traffic pattern.
@@ -154,23 +181,40 @@ For a GET request, the `dns` query parameter is unpadded base64url containing th
 
 This project is a DNS resolver/DoH service, not a general-purpose HTTP/SOCKS proxy, tunnel, VPN panel, or remote shell. SnapDeploy currently documents restrictions on proxies/tunnels and separately documents a shared-domain per-IP request limit; a custom domain is not subject to that shared-domain limit.
 
-## 🌐 Free DNS Services
+## Project files
 
-The endpoints below are third-party deployments listed for convenience; this repository's code does not control their availability.
+| File | Purpose |
+|---|---|
+| `main.go` | DoH gateway: limiter, validation, proxying, health check. |
+| `main_test.go` | Unit tests, run during `docker build`. |
+| `go.mod` | Go module definition (`go 1.27`, no external dependencies). |
+| `Dockerfile` | Multi-stage build (separate Blocky and gateway builder stages) and Alpine runtime image. |
+| `entrypoint.sh` | Starts and supervises Blocky and the gateway. |
+| `config.yml` | Blocky configuration. |
+| `docker-compose.yml` | Local run with `TRUST_PROXY=false`. |
+| `CHANGELOG.md` | Change history and code-audit notes. |
+| `LICENSE` | License text. |
+
+## Changelog
+
+See [`CHANGELOG.md`](CHANGELOG.md) for the full change history and code-audit notes.
+
+## 🌐 Free DNS Services
 
 High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 
 | Blocklist | DNS-over-HTTPS (DoH) |
 | :--- | :--- |
 | Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dns.mydoh.workers.dev/dns-query` (Recommended) |
 | Multi Pro + TIF | `https://dns-pi.vercel.app/api/doh/dns-query` (Recommended) |
 | Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
-| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
-| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
+| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` |
+| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` |
 
-## ⚡ Related project: Bandwidth Hero Server
+## ⚡ Bandwidth Hero Server
 
-Not part of this repository (no code for it is included here). A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
+A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
 
 Bandwidth Hero Server fetches remote images, compresses them on the fly, and delivers optimized versions to the client. This significantly reduces data consumption while improving page load performance.
 
@@ -181,18 +225,6 @@ Bandwidth Hero Server fetches remote images, compresses them on the fly, and del
 If you find this project useful, donations are appreciated:
 
 - **Bitcoin**: `1HntwKxyqGCfnSGvGLMUTRAqLnTvLarAQP`
-
-## Project files
-
-| File | Purpose |
-|---|---|
-| `main.go` | DoH gateway: limiter, validation, proxying, health check. |
-| `main_test.go` | Unit tests, run during `docker build`. |
-| `Dockerfile` | Multi-stage build of the gateway and Blocky, Alpine runtime image. |
-| `entrypoint.sh` | Starts and supervises Blocky and the gateway. |
-| `config.yml` | Blocky configuration. |
-| `docker-compose.yml` | Local run with `TRUST_PROXY=false`. |
-| `CHANGELOG.md` | Change history. |
 
 ## License
 
