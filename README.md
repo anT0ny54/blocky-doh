@@ -19,7 +19,7 @@ Internet / SnapDeploy HTTPS
   doh-gateway :$PORT
      |       |
      |       +-- per-client-IP limiter: 99 / 60s strict sliding window
-     |       +-- max concurrent DNS requests: 16 (default and hard cap)
+     |       +-- max concurrent DNS requests: 8 (default and hard cap)
      |       +-- DNS wire-format validation
      |
      v
@@ -44,9 +44,9 @@ The `/dns-query` path is implemented by `doh-gateway`, which answers `OPTIONS` p
 5. Add your custom domain if the service is intended for public DoH clients. SnapDeploy terminates HTTPS and routes to the container.
 6. Use `/dns-query` as the DoH path.
 
-The Docker build compiles the gateway in its own Go builder stage (`gateway-builder`) and runs `go vet` and `go test` there, so a failing test fails the build. The final Alpine image contains only the gateway binary, the Blocky binary, `config.yml`, `entrypoint.sh`, `ca-certificates`, and the BusyBox `wget` used by the health check, and runs as the unprivileged `app` user. The image health check (every 30 s, 3 s timeout, 5 s start period, 3 retries) requests `/healthz` on `$PORT` (default `8080`; a leading `:` in `PORT` is tolerated).
+The Docker build uses a single Go builder stage (the Small tier's two-stage limit leaves exactly one builder plus one runtime stage): it first clones and builds Blocky, then copies in the gateway sources, runs `go vet` and `go test`, and builds the gateway binary — so a failing test fails the build. Because the Blocky clone/build precedes the gateway `COPY` instructions, editing gateway sources leaves the cached Blocky layers untouched; only the later layers rebuild. That stage clones the Blocky repository at the pinned `BLOCKY_VERSION` tag (`v0.35.0`, overridable with `--build-arg BLOCKY_VERSION=<tag>`) and builds it with `make build BIN_OUT_DIR=/bin`. The build requires network access to github.com for the clone step, so restricted build environments without outbound HTTPS to GitHub fail there with a `Failed to connect to github.com port 443`-style error.
 
-The Blocky backend is compiled in a separate builder stage (`blocky-builder`), so editing the gateway source never invalidates the cached Blocky clone/compile layers and BuildKit can build the two binaries in parallel. That stage clones the Blocky repository at the pinned `BLOCKY_VERSION` tag (`v0.35.0`, overridable with `--build-arg BLOCKY_VERSION=<tag>`) and builds it with `make build BIN_OUT_DIR=/bin`. The build requires network access to github.com for the clone step, so restricted build environments without outbound HTTPS to GitHub fail there with a `Failed to connect to github.com port 443`-style error.
+The final Alpine image contains only the gateway binary, the Blocky binary, `config.yml`, `entrypoint.sh`, `ca-certificates`, and the BusyBox `wget` used by the health check, and runs as the unprivileged `app` user — **without `CAP_NET_BIND_SERVICE`, so no listener may use a port below 1024**. `config.yml` pins Blocky to loopback ports `5353`/`8053` exactly so Blocky never binds its default `:53` (which would fail with `listen udp :53: bind: permission denied`); `entrypoint.sh` additionally refuses to start with a clear, naming error if `PORT` or any Blocky listener port in `config.yml` is privileged, instead of crash-looping at bind time. The image health check (every 30 s, 3 s timeout, 5 s start period, 3 retries) requests `/healthz` on `$PORT` (default `8080`; a leading `:` in `PORT` is tolerated).
 
 Example endpoint after a custom domain is attached:
 
@@ -59,11 +59,11 @@ The `/healthz` endpoint (`GET`/`HEAD`) returns `200` only when a TCP connection 
 The gateway accepts RFC-style DoH GET and POST requests on `/dns-query`:
 
 - GET `dns=` values are decoded as unpadded base64url and forwarded internally as bounded POST requests. Padded values are rejected with `400`.
-- GET query strings longer than `dns=` plus the encoded form of 65,535 bytes (87,384 characters) are rejected with `413` before the query string is parsed at all. This single bound also caps the `dns=` value, so no decoded message can exceed 65,535 bytes. `HEAD` and any method other than `GET`/`POST`/`OPTIONS` receives `405`.
-- POST requests require `application/dns-message` and are capped at the 65,535-byte DNS wire-format maximum.
+- GET query strings longer than `dns=` plus the base64url-encoded form of 8,192 bytes (10,924 characters) — 10,928 characters total — are rejected with `413` before the query string is parsed at all. This single bound also caps the `dns=` value, so no decoded message can exceed 8,192 bytes. `HEAD` and any method other than `GET`/`POST`/`OPTIONS` receives `405`.
+- POST requests require `application/dns-message` and are capped at 8,192 bytes (the gateway's wire-format cap, well under the 65,535-byte DNS maximum).
 - Incoming DNS messages are structurally validated before Blocky is called; exactly one DNS question is required and resource records are capped at 4,096.
 - Upstream responses must be HTTP `200`, use `application/dns-message`, fit the same size bound, have valid DNS wire structure, preserve the request transaction ID, and echo the request's question section (owner name and QTYPE/QCLASS, compression-expanded).
-- Backend response headers are capped at 16 KiB, response bodies at 65,535 bytes, and backend redirects are never followed.
+- Backend response headers are capped at 16 KiB, response bodies at 8,192 bytes, and backend redirects are never followed.
 - The gateway never forwards arbitrary upstream response headers to clients.
 
 This validation is primarily a resource-safety and protocol-correctness guard; it does not replace DNSSEC validation or Blocky's resolver protections.
@@ -78,7 +78,7 @@ This validation is primarily a resource-safety and protocol-correctness guard; i
 | `204` | `OPTIONS` preflight on `/dns-query`. |
 | `400` | GET without `dns=`, padded or otherwise invalid base64url, unreadable POST body, or a message that fails DNS structural validation. |
 | `405` | Method not allowed (`Allow` header is set). |
-| `413` | GET query string over the 10,927-character bound, or POST body over 8,192 bytes. |
+| `413` | GET query string over the 10,928-character bound, or POST body over 8,192 bytes. |
 | `415` | POST whose `Content-Type` is not `application/dns-message` (parameters such as `charset` are accepted). |
 | `429` | Client exceeded its sliding window; `Retry-After` is 1–60 seconds. |
 | `500` | The gateway could not build the backend request. |
@@ -110,7 +110,7 @@ Environment variables read by the gateway. Unset, empty, non-numeric, below-1 or
 
 | Variable | Default | Allowed range | Meaning |
 |---|---|---|---|
-| `PORT` | `8080` | TCP port number | Public listener port (a leading `:` is accepted). The value is not range-checked; an unusable value makes the gateway exit at startup. |
+| `PORT` | `8080` | TCP port number | Public listener port (a leading `:` is accepted). The gateway itself does not range-check it; `entrypoint.sh` refuses to start if it names a privileged port (<1024), and any other unusable value makes the gateway exit at startup. |
 | `RATE_LIMIT` | `99` | 1–256 | Requests per client IP per 60-second sliding window. The window length is fixed. |
 | `MAX_CLIENTS` | `8192` | 1–32768 | Maximum client rate-limit states held in memory. |
 | `MAX_CONCURRENT` | `8` | 1–8 | Maximum in-flight DNS requests, including body parsing and backend connections. 8 is the hard cap for this image. |
@@ -188,8 +188,8 @@ This project is a DNS resolver/DoH service, not a general-purpose HTTP/SOCKS pro
 | `main.go` | DoH gateway: limiter, validation, proxying, health check. |
 | `main_test.go` | Unit tests, run during `docker build`. |
 | `go.mod` | Go module definition (`go 1.27`, no external dependencies). |
-| `Dockerfile` | Multi-stage build (separate Blocky and gateway builder stages) and Alpine runtime image. |
-| `entrypoint.sh` | Starts and supervises Blocky and the gateway. |
+| `Dockerfile` | Single-builder-stage build and Alpine runtime image. |
+| `entrypoint.sh` | Starts and supervises Blocky and the gateway; refuses privileged ports (<1024) up front. |
 | `config.yml` | Blocky configuration. |
 | `docker-compose.yml` | Local run with `TRUST_PROXY=false`. |
 | `CHANGELOG.md` | Change history and code-audit notes. |

@@ -14,6 +14,46 @@ STATUS_DIR="$STATUS_ROOT/doh-gateway-status.$$"
 BLOCKY_STATUS="$STATUS_DIR/blocky"
 GATEWAY_STATUS="$STATUS_DIR/gateway"
 
+# Unprivileged-port guard. The image runs as the unprivileged "app" user
+# without CAP_NET_BIND_SERVICE, so any listener below 1024 dies at bind
+# time with "permission denied" (Blocky on its default :53 logs:
+# "start udp listener failed: listen udp :53: bind: permission denied")
+# and the container crash-loops. Refuse such configurations up front with
+# an error that names the offending setting instead.
+require_unprivileged() {
+  what=$1
+  value=$2
+  p=${value##*:}
+  # strip surrounding quotes, brackets and whitespace
+  p=$(printf '%s' "$p" | sed 's/^[^0-9]*//; s/[^0-9]*$//')
+  case $p in
+    ''|*[!0-9]*) return 0 ;;  # non-numeric: let the daemon report its own error
+  esac
+  if [ "$p" -lt 1024 ]; then
+    printf 'entrypoint: refusing to start: %s requests privileged port :%s,\n' "$what" "$p" >&2
+    printf 'entrypoint: the container runs as user "app" without CAP_NET_BIND_SERVICE.\n' >&2
+    printf 'entrypoint: use a port >= 1024 (see config.yml and PORT), or grant CAP_NET_BIND_SERVICE.\n' >&2
+    exit 1
+  fi
+}
+
+BLOCKY_CONFIG=/etc/blocky/config.yml
+# Listener values under the "ports:" block of the pinned Blocky config.
+# shellcheck disable=SC2046
+for value in $(awk '
+  /^ports:/ { inports=1; next }
+  inports && /^[^[:space:]]/ { inports=0 }
+  inports && /^[[:space:]]+(dns|http|tls|https):/ {
+    sub(/^[[:space:]]*(dns|http|tls|https):[[:space:]]*/, "")
+    print
+  }
+' "$BLOCKY_CONFIG"); do
+  require_unprivileged "$BLOCKY_CONFIG listener" "$value"
+done
+if [ -n "${PORT:-}" ]; then
+  require_unprivileged "PORT environment variable" "$PORT"
+fi
+
 run_supervised() {
   status_file=$1
   shift
