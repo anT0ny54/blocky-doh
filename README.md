@@ -19,7 +19,7 @@ Internet / SnapDeploy HTTPS
   doh-gateway :$PORT
      |       |
      |       +-- per-client-IP limiter: 99 / 60s strict sliding window
-     |       +-- max concurrent DNS requests: 8 (default and hard cap)
+     |       +-- max concurrent DNS requests: 8 (default and hard cap; configurable only downward)
      |       +-- DNS wire-format validation
      |
      v
@@ -113,7 +113,7 @@ Environment variables read by the gateway. Unset, empty, non-numeric, below-1 or
 | `PORT` | `8080` | TCP port number | Public listener port (a leading `:` is accepted). The gateway itself does not range-check it; `entrypoint.sh` refuses to start if it names a privileged port (<1024), and any other unusable value makes the gateway exit at startup. |
 | `RATE_LIMIT` | `99` | 1–256 | Requests per client IP per 60-second sliding window. The window length is fixed. |
 | `MAX_CLIENTS` | `8192` | 1–32768 | Maximum client rate-limit states held in memory. |
-| `MAX_CONCURRENT` | `8` | 1–8 | Maximum in-flight DNS requests, including body parsing and backend connections. 8 is the hard cap for this image. |
+| `MAX_CONCURRENT` | `8` | 1–8 | Maximum in-flight DNS requests, including body parsing and backend connections. The default and hard cap are both 8, so the variable can only lower the limit. |
 | `TRUST_PROXY` | `false` in the binary, `true` in the Docker image | `true`/`false` (case-insensitive) | Use `X-Forwarded-For`/`X-Real-IP` for client identity. |
 
 The Dockerfile's `ENV` sets `GOMAXPROCS=1`, `GOGC=100`, `GOMEMLIMIT=160MiB`, `RATE_LIMIT=99`, `MAX_CLIENTS=8192`, `MAX_CONCURRENT=8` and `TRUST_PROXY=true`.

@@ -36,6 +36,7 @@ const (
 	defaultWindow         = 60 * time.Second
 	defaultMaxClients     = 8192
 	defaultMaxConcurrent  = 8
+	maxConcurrentLimit    = 8
 	maxRateLimit          = 256
 	maxLimiterClients     = 32768
 	maxDNSBody            = 8192
@@ -63,6 +64,9 @@ type clientState struct {
 	times []int64
 	seen  int64
 }
+// limiter.mu must always be acquired before clientState.mu. All current paths
+// preserve that order; adding a path that takes clientState.mu first can
+// deadlock against check/evictStaleLocked/retryAfter.
 type limiter struct {
 	mu         sync.RWMutex
 	clients    map[string]*clientState
@@ -657,7 +661,7 @@ func main() {
 	}
 	rate := parseEnvInt("RATE_LIMIT", defaultRate, maxRateLimit)
 	maxClients := parseEnvInt("MAX_CLIENTS", defaultMaxClients, maxLimiterClients)
-	maxConcurrent := parseEnvInt("MAX_CONCURRENT", defaultMaxConcurrent, defaultMaxConcurrent)
+	maxConcurrent := parseEnvInt("MAX_CONCURRENT", defaultMaxConcurrent, maxConcurrentLimit)
 	trustProxy := parseEnvBool("TRUST_PROXY", false)
 	lim := newLimiter(rate, defaultWindow, maxClients)
 	ctx, cancel := context.WithCancel(context.Background())
