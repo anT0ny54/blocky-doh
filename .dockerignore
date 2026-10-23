@@ -1,10 +1,7 @@
-.git
-.github
-.gitignore
-README.md
-CHANGELOG.md
-LICENSE
-docker-compose.yml
-keep-alive.txt
-*.zip
-*.tar.gz
+# Deny by default; the Dockerfile COPYs only these files.
+*
+!go.mod
+!main.go
+!main_test.go
+!config.yml
+!entrypoint.sh
