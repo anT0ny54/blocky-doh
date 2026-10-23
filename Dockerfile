@@ -38,10 +38,19 @@ COPY main.go main_test.go ./
 
 RUN go vet ./... && \
     go test ./... && \
+    mkdir -p /out && \
     go build \
         -trimpath \
         -ldflags="-s -w" \
         -o /out/doh-gateway .
+
+# Runtime files and their permissions are prepared here: COPY --from preserves
+# file modes, so the runtime stage needs no chmod layer that would store a
+# second copy of the large Blocky binary.
+COPY config.yml entrypoint.sh /out/
+
+RUN chmod 0555 /out/doh-gateway /out/entrypoint.sh /bin/blocky && \
+    chmod 0444 /out/config.yml
 
 # ------------------------------------------------------------
 # Runtime
@@ -54,14 +63,8 @@ RUN apk add --no-cache ca-certificates && \
 
 COPY --from=builder /out/doh-gateway /doh-gateway
 COPY --from=builder /bin/blocky /blocky
-COPY config.yml /etc/blocky/config.yml
-COPY entrypoint.sh /entrypoint.sh
-
-RUN chmod 0555 \
-        /doh-gateway \
-        /blocky \
-        /entrypoint.sh && \
-    chmod 0444 /etc/blocky/config.yml
+COPY --from=builder /out/config.yml /etc/blocky/config.yml
+COPY --from=builder /out/entrypoint.sh /entrypoint.sh
 
 EXPOSE 8080
 

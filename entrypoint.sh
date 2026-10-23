@@ -5,12 +5,10 @@ BLOCKY_PID=0
 GATEWAY_PID=0
 SHUTDOWN_DONE=0
 
-# Deterministic status directory: stale directories left behind by
-# previously SIGKILLed containers are removed before ours is created.
+# Use an atomically-created private status directory. PID-only names can
+# collide when instances share a temporary volume but use separate PID namespaces.
 STATUS_ROOT="${TMPDIR:-/tmp}"
-rm -rf "$STATUS_ROOT"/doh-gateway-status.* 2>/dev/null || :
-STATUS_DIR="$STATUS_ROOT/doh-gateway-status.$$"
-( umask 077 && mkdir -p "$STATUS_DIR" )
+STATUS_DIR=$(umask 077; mktemp -d "$STATUS_ROOT/doh-gateway-status.XXXXXX")
 BLOCKY_STATUS="$STATUS_DIR/blocky"
 GATEWAY_STATUS="$STATUS_DIR/gateway"
 
@@ -45,6 +43,7 @@ for value in $(awk '
   inports && /^[^[:space:]]/ { inports=0 }
   inports && /^[[:space:]]+(dns|http|tls|https):/ {
     sub(/^[[:space:]]*(dns|http|tls|https):[[:space:]]*/, "")
+    sub(/[[:space:]]+#.*$/, "")
     print
   }
 ' "$BLOCKY_CONFIG"); do
@@ -105,7 +104,7 @@ on_signal() {
 trap on_signal INT TERM
 trap shutdown EXIT
 
-run_supervised "$BLOCKY_STATUS" /blocky --config /etc/blocky/config.yml &
+run_supervised "$BLOCKY_STATUS" /blocky --config "$BLOCKY_CONFIG" &
 BLOCKY_PID=$!
 run_supervised "$GATEWAY_STATUS" /doh-gateway &
 GATEWAY_PID=$!

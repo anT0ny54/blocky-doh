@@ -183,6 +183,40 @@ func TestLimiterRetryAfterReflectsOldestTimestamp(t *testing.T) {
 		t.Fatalf("retryAfter for unknown client=%v; want 1s", got)
 	}
 }
+func TestLimiterRetryAfterFindsOldestTimestampWhenOutOfOrder(t *testing.T) {
+	l := newLimiter(2, 60*time.Second, 1024)
+	start := time.Unix(4_100_000, 0)
+	// Simulate goroutines acquiring the limiter lock in an order different
+	// from when each captured its timestamp.
+	if got := l.check("203.0.113.10", start.Add(30*time.Second)); got != limitAllowed {
+		t.Fatalf("first processed request got %v; want allowed", got)
+	}
+	if got := l.check("203.0.113.10", start); got != limitAllowed {
+		t.Fatalf("older timestamp got %v; want allowed", got)
+	}
+	now := start.Add(31 * time.Second)
+	if got := l.check("203.0.113.10", now); got != limitRateLimited {
+		t.Fatalf("third request got %v; want rate limited", got)
+	}
+	if got := l.retryAfter("203.0.113.10", now); got != 29*time.Second {
+		t.Fatalf("retryAfter=%v; want 29s from the oldest timestamp", got)
+	}
+}
+
+func TestLimiterLivenessTimestampDoesNotRegress(t *testing.T) {
+	l := newLimiter(1, 60*time.Second, 1024)
+	start := time.Unix(4_200_000, 0)
+	if got := l.check("203.0.113.10", start.Add(10*time.Second)); got != limitAllowed {
+		t.Fatalf("first processed request got %v; want allowed", got)
+	}
+	if got := l.check("203.0.113.10", start); got != limitRateLimited {
+		t.Fatalf("older timestamp got %v; want rate limited", got)
+	}
+	if got := l.clients["203.0.113.10"].seen; got != start.Add(10*time.Second).UnixNano() {
+		t.Fatalf("seen timestamp regressed to %v", time.Unix(0, got))
+	}
+}
+
 func TestRetryAfterSecondsRoundsUpAndClamps(t *testing.T) {
 	cases := map[time.Duration]int{
 		-time.Second:            1,
@@ -382,16 +416,17 @@ func TestValidateDNSMessageRejectsExpandedCompressedNameOver255Bytes(t *testing.
 		t.Fatal("expanded compressed DNS name over 255 bytes was accepted")
 	}
 }
-func TestExpandDNSNameRejectsOutOfBoundsOffset(t *testing.T) {
+func TestExpandDNSNameCanonicalRejectsOutOfBoundsOffset(t *testing.T) {
 	message := testDNSQuery(0x17)
 	for _, offset := range []int{-1, len(message), len(message) + 5} {
-		if _, _, err := expandDNSName(message, offset); err == nil {
-			t.Fatalf("expandDNSName accepted out-of-bounds offset %d", offset)
+		if _, _, err := expandDNSNameCanonical(message, offset); err == nil {
+			t.Fatalf("expandDNSNameCanonical accepted out-of-bounds offset %d", offset)
 		}
 	}
-	name, end, err := expandDNSName(message, 12)
-	if err != nil || name != "example.com" || end != 25 {
-		t.Fatalf("expandDNSName=%q,%d,%v; want example.com,25,nil", name, end, err)
+	name, end, err := expandDNSNameCanonical(message, 12)
+	want := []byte{7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0}
+	if err != nil || !bytes.Equal(name, want) || end != 25 {
+		t.Fatalf("expandDNSNameCanonical=%v,%d,%v; want %v,25,nil", name, end, err, want)
 	}
 }
 func TestDNSQuestionEqual(t *testing.T) {
@@ -414,6 +449,24 @@ func TestDNSQuestionEqual(t *testing.T) {
 		t.Fatal("truncated response question was accepted")
 	}
 }
+func TestDNSQuestionEqualPreservesLabelBoundaries(t *testing.T) {
+	// A single label containing a dot is not equivalent to two labels, even
+	// though rendering both names with dots would produce the same string.
+	query := []byte{
+		0x12, 0x34, 0x01, 0x00,
+		0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x03, 'a', '.', 'b', 0x00, 0x00, 0x01, 0x00, 0x01,
+	}
+	response := []byte{
+		0x12, 0x34, 0x81, 0x80,
+		0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x01, 'a', 0x01, 'b', 0x00, 0x00, 0x01, 0x00, 0x01,
+	}
+	if dnsQuestionEqual(query, response) {
+		t.Fatal("different DNS label boundaries were treated as an identical question")
+	}
+}
+
 func TestDNSQuestionEqualIsCaseInsensitive(t *testing.T) {
 	query := testDNSQuery(0x71)
 	response := testDNSResponse(query)
@@ -458,6 +511,15 @@ func TestDoHPOSTForwardsValidatedWireMessage(t *testing.T) {
 		t.Fatal("client response differs from backend DNS response")
 	}
 }
+func TestDecodeDoHGETRejectsNonCanonicalBase64PaddingBits(t *testing.T) {
+	// "Zg" canonically encodes "f"; "Zh" decodes to the same byte but has
+	// non-zero unused trailing bits and must be rejected by the strict decoder.
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/dns-query?dns=Zh", nil)
+	if _, err := decodeDoHQuery(httptest.NewRecorder(), req); err != errInvalidDNSParameter {
+		t.Fatalf("decodeDoHQuery error=%v; want %v for non-canonical base64url", err, errInvalidDNSParameter)
+	}
+}
+
 func TestDoHGETDecodesAndNormalizesToPOST(t *testing.T) {
 	query := testDNSQuery(0x31)
 	response := testDNSResponse(query)
@@ -592,7 +654,7 @@ func TestDoHConcurrencyLimitReturns503(t *testing.T) {
 }
 func TestDoHConcurrencyGateRejectsBeforeReadingBody(t *testing.T) {
 	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("backend must not be reached while the concurrency gate is full")
+		t.Error("backend must not be reached while the concurrency gate is full")
 	})
 	defer cleanup()
 	for i := 0; i < cap(s.concurrent); i++ {
@@ -643,8 +705,35 @@ func TestDoHRejectsInvalidInputBeforeBackend(t *testing.T) {
 		status int
 	}{
 		{
-			name:   "invalid GET base64",
-			req:    httptest.NewRequest(http.MethodGet, "http://gateway.test/dns-query?dns=%%%", nil),
+			name:   "padded GET base64url",
+			req:    httptest.NewRequest(http.MethodGet, "http://gateway.test/dns-query?dns=Zg==", nil),
+			status: http.StatusBadRequest,
+		},
+		{
+			name:   "GET without dns parameter",
+			req:    httptest.NewRequest(http.MethodGet, "http://gateway.test/dns-query?x=1", nil),
+			status: http.StatusBadRequest,
+		},
+		{
+			name: "GET base64 with embedded newline",
+			req: func() *http.Request {
+				encoded := base64.RawURLEncoding.EncodeToString(testDNSQuery(0x44))
+				malformed := encoded[:4] + "%0A" + encoded[4:]
+				return httptest.NewRequest(http.MethodGet, "http://gateway.test/dns-query?dns="+malformed, nil)
+			}(),
+			status: http.StatusBadRequest,
+		},
+		{
+			name: "duplicate dns parameters",
+			req: func() *http.Request {
+				encoded := base64.RawURLEncoding.EncodeToString(testDNSQuery(0x45))
+				return httptest.NewRequest(http.MethodGet, "http://gateway.test/dns-query?dns="+encoded+"&dns="+encoded, nil)
+			}(),
+			status: http.StatusBadRequest,
+		},
+		{
+			name:   "malformed query escape",
+			req:    httptest.NewRequest(http.MethodGet, "http://gateway.test/dns-query?dns=%ZZ", nil),
 			status: http.StatusBadRequest,
 		},
 		{
@@ -720,6 +809,16 @@ func TestDoHRejectsInvalidUpstreamResponse(t *testing.T) {
 		{"transaction id mismatch", http.StatusOK, "application/dns-message", func() []byte {
 			b := testDNSResponse(query)
 			b[0]++
+			return b
+		}()},
+		{"opcode mismatch", http.StatusOK, "application/dns-message", func() []byte {
+			b := testDNSResponse(query)
+			b[2] |= 0x08
+			return b
+		}()},
+		{"recursion-desired mismatch", http.StatusOK, "application/dns-message", func() []byte {
+			b := testDNSResponse(query)
+			b[2] &^= 0x01
 			return b
 		}()},
 		{"question mismatch", http.StatusOK, "application/dns-message", func() []byte {
@@ -858,6 +957,7 @@ func TestGatewayHealthProbeIsCached(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer ln.Close()
 	s := &server{backendAddr: ln.Addr().String()}
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
 	rec := httptest.NewRecorder()

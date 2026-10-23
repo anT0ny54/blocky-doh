@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -19,6 +20,8 @@ import (
 	"syscall"
 	"time"
 )
+
+var strictRawURLEncoding = base64.RawURLEncoding.Strict()
 
 var (
 	errMissingDNSParameter = errors.New("missing dns parameter")
@@ -64,6 +67,7 @@ type clientState struct {
 	times []int64
 	seen  int64
 }
+
 // limiter.mu must always be acquired before clientState.mu. All current paths
 // preserve that order; adding a path that takes clientState.mu first can
 // deadlock against check/evictStaleLocked/retryAfter.
@@ -125,7 +129,11 @@ func (l *limiter) check(ip string, now time.Time) limitResult {
 	// Refresh liveness for every request, including rejected ones, so a
 	// persistently rate-limited client is not evicted as "idle" while it
 	// is still actively (if unsuccessfully) reaching the gateway.
-	state.seen = now.UnixNano()
+	// Requests can capture their timestamps before contending on the limiter
+	// locks, so keep liveness monotonic if an older timestamp is processed later.
+	if seen := now.UnixNano(); seen > state.seen {
+		state.seen = seen
+	}
 	if len(state.times) >= l.rate {
 		state.mu.Unlock()
 		return limitRateLimited
@@ -158,7 +166,16 @@ func (l *limiter) retryAfter(ip string, now time.Time) time.Duration {
 	if len(state.times) == 0 {
 		return time.Second
 	}
-	if wait := time.Unix(0, state.times[0]).Add(l.window).Sub(now); wait > time.Second {
+	// Requests timestamp themselves before entering the limiter, so concurrent
+	// callers may append timestamps out of chronological order. Find the true
+	// oldest request instead of assuming the first slice element is oldest.
+	oldest := state.times[0]
+	for _, timestamp := range state.times[1:] {
+		if timestamp < oldest {
+			oldest = timestamp
+		}
+	}
+	if wait := time.Unix(0, oldest).Add(l.window).Sub(now); wait > time.Second {
 		return wait
 	}
 	return time.Second
@@ -333,14 +350,29 @@ func decodeDoHQuery(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 		if len(r.URL.RawQuery) > len("dns=")+base64.RawURLEncoding.EncodedLen(maxDNSBody) {
 			return nil, errDNSMessageTooLarge
 		}
-		// The raw-query bound above already caps the dns= value at the
-		// encoded size of maxDNSBody, so the decoded message cannot exceed
-		// maxDNSBody either.
-		encoded := r.URL.Query().Get("dns")
-		if encoded == "" {
+		// The bound above also caps the decoded message at maxDNSBody.
+		params, err := url.ParseQuery(r.URL.RawQuery)
+		if err != nil {
+			return nil, errInvalidDNSParameter
+		}
+		dnsValues := params["dns"]
+		if len(dnsValues) == 0 || dnsValues[0] == "" {
 			return nil, errMissingDNSParameter
 		}
-		decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+		if len(dnsValues) != 1 {
+			return nil, errInvalidDNSParameter
+		}
+		encoded := dnsValues[0]
+		// Go's base64 decoder ignores CR/LF, but DoH GET encoding must be a
+		// single unpadded base64url token. Reject non-alphabet bytes explicitly.
+		for i := 0; i < len(encoded); i++ {
+			c := encoded[i]
+			if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+				(c >= '0' && c <= '9') || c == '-' || c == '_') {
+				return nil, errInvalidDNSParameter
+			}
+		}
+		decoded, err := strictRawURLEncoding.DecodeString(encoded)
 		if err != nil {
 			return nil, errInvalidDNSParameter
 		}
@@ -363,10 +395,11 @@ func decodeDoHQuery(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 
 // walkDNSName follows the (possibly compressed) name starting at offset and
 // returns the offset of the first byte after it at its original position. When
-// out is non-nil the labels are appended to it, joined with dots. Compression
-// pointers must point strictly backwards and past the header, and both the
-// number of pointer hops and the expanded wire length are bounded.
-func walkDNSName(message []byte, offset int, out *strings.Builder) (int, error) {
+// canonical is non-nil, an unambiguous, ASCII-case-folded wire name is appended
+// so equality checks preserve label boundaries instead of joining labels with dots.
+// Compression pointers must point strictly backwards and past the header, and
+// both the number of pointer hops and the expanded wire length are bounded.
+func walkDNSName(message []byte, offset int, canonical *[]byte) (int, error) {
 	if offset < 0 || offset >= len(message) {
 		return 0, errors.New("dns name offset out of bounds")
 	}
@@ -393,7 +426,7 @@ func walkDNSName(message []byte, offset int, out *strings.Builder) (int, error) 
 			}
 			hops++
 			if hops > maxDNSNameHops {
-				return 0, errors.New("dns compression pointer loop")
+				return 0, errors.New("too many dns compression pointer hops")
 			}
 			pos = pointer
 		case 0x00:
@@ -402,6 +435,9 @@ func walkDNSName(message []byte, offset int, out *strings.Builder) (int, error) 
 				nameLen++
 				if nameLen > maxDNSNameLength {
 					return 0, errors.New("dns name too long")
+				}
+				if canonical != nil {
+					*canonical = append(*canonical, 0)
 				}
 				if next < 0 {
 					next = pos
@@ -418,11 +454,16 @@ func walkDNSName(message []byte, offset int, out *strings.Builder) (int, error) 
 			if nameLen > maxDNSNameLength {
 				return 0, errors.New("dns name too long")
 			}
-			if out != nil {
-				if out.Len() > 0 {
-					out.WriteByte('.')
+			label := message[pos : pos+length]
+			if canonical != nil {
+				*canonical = append(*canonical, byte(length))
+				labelStart := len(*canonical)
+				*canonical = append(*canonical, label...)
+				for i := labelStart; i < len(*canonical); i++ {
+					if c := (*canonical)[i]; c >= 'A' && c <= 'Z' {
+						(*canonical)[i] = c + ('a' - 'A')
+					}
 				}
-				out.Write(message[pos : pos+length])
 			}
 			pos += length
 		default:
@@ -433,42 +474,24 @@ func walkDNSName(message []byte, offset int, out *strings.Builder) (int, error) 
 func skipDNSName(message []byte, offset int) (int, error) {
 	return walkDNSName(message, offset, nil)
 }
-func expandDNSName(message []byte, offset int) (string, int, error) {
-	var b strings.Builder
-	end, err := walkDNSName(message, offset, &b)
+func expandDNSNameCanonical(message []byte, offset int) ([]byte, int, error) {
+	canonical := make([]byte, 0, maxDNSNameLength)
+	end, err := walkDNSName(message, offset, &canonical)
 	if err != nil {
-		return "", 0, err
+		return nil, 0, err
 	}
-	return b.String(), end, nil
-}
-func dnsNameEqual(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		x, y := a[i], b[i]
-		if x >= 'A' && x <= 'Z' {
-			x += 'a' - 'A'
-		}
-		if y >= 'A' && y <= 'Z' {
-			y += 'a' - 'A'
-		}
-		if x != y {
-			return false
-		}
-	}
-	return true
+	return canonical, end, nil
 }
 func dnsQuestionEqual(query, response []byte) bool {
-	qName, qEnd, err := expandDNSName(query, 12)
+	qName, qEnd, err := expandDNSNameCanonical(query, 12)
 	if err != nil {
 		return false
 	}
-	rName, rEnd, err := expandDNSName(response, 12)
+	rName, rEnd, err := expandDNSNameCanonical(response, 12)
 	if err != nil {
 		return false
 	}
-	if !dnsNameEqual(qName, rName) || qEnd+4 > len(query) || rEnd+4 > len(response) {
+	if !bytes.Equal(qName, rName) || qEnd+4 > len(query) || rEnd+4 > len(response) {
 		return false
 	}
 	return bytes.Equal(query[qEnd:qEnd+4], response[rEnd:rEnd+4])
@@ -574,7 +597,7 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	switch s.limiter.check(ip, now) {
 	case limitAllowed:
 	case limitRateLimited:
-		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(s.limiter.retryAfter(ip, now))))
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(s.limiter.retryAfter(ip, time.Now()))))
 		writeGatewayError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	default:
@@ -611,16 +634,14 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
-	if resp.ContentLength > maxDNSBody {
+	// Reject bad status, content type or declared size before reading the
+	// body, so error responses are never buffered.
+	if resp.StatusCode != http.StatusOK || !validContentType(resp.Header.Get("Content-Type")) || resp.ContentLength > maxDNSBody {
 		writeGatewayError(w, http.StatusBadGateway, "invalid upstream DNS response")
 		return
 	}
 	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxDNSBody+1))
-	if err != nil {
-		writeGatewayError(w, http.StatusBadGateway, "invalid upstream DNS response")
-		return
-	}
-	if len(responseBody) > maxDNSBody || resp.StatusCode != http.StatusOK || !validContentType(resp.Header.Get("Content-Type")) {
+	if err != nil || len(responseBody) > maxDNSBody {
 		writeGatewayError(w, http.StatusBadGateway, "invalid upstream DNS response")
 		return
 	}
@@ -630,6 +651,12 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	}
 	if !bytes.Equal(responseBody[:2], query[:2]) {
 		writeGatewayError(w, http.StatusBadGateway, "upstream DNS transaction ID mismatch")
+		return
+	}
+	// DNS responses must copy the query's opcode and recursion-desired bit.
+	// Bit 7 is QR and is expected to differ; mask 0x79 selects opcode + RD.
+	if query[2]&0x79 != responseBody[2]&0x79 {
+		writeGatewayError(w, http.StatusBadGateway, "upstream DNS response opcode or RD mismatch")
 		return
 	}
 	if !dnsQuestionEqual(query, responseBody) {

@@ -46,7 +46,9 @@ The `/dns-query` path is implemented by `doh-gateway`, which answers `OPTIONS` p
 
 The Docker build uses a single Go builder stage (the Small tier's two-stage limit leaves exactly one builder plus one runtime stage): it first clones and builds Blocky, then copies in the gateway sources, runs `go vet` and `go test`, and builds the gateway binary — so a failing test fails the build. Because the Blocky clone/build precedes the gateway `COPY` instructions, editing gateway sources leaves the cached Blocky layers untouched; only the later layers rebuild. That stage clones the Blocky repository at the pinned `BLOCKY_VERSION` tag (`v0.35.0`, overridable with `--build-arg BLOCKY_VERSION=<tag>`) and builds it with `make build BIN_OUT_DIR=/bin`. The build requires network access to github.com for the clone step, so restricted build environments without outbound HTTPS to GitHub fail there with a `Failed to connect to github.com port 443`-style error.
 
-The final Alpine image contains only the gateway binary, the Blocky binary, `config.yml`, `entrypoint.sh`, `ca-certificates`, and the BusyBox `wget` used by the health check, and runs as the unprivileged `app` user — **without `CAP_NET_BIND_SERVICE`, so no listener may use a port below 1024**. `config.yml` pins Blocky to loopback ports `5353`/`8053` exactly so Blocky never binds its default `:53` (which would fail with `listen udp :53: bind: permission denied`); `entrypoint.sh` additionally refuses to start with a clear, naming error if `PORT` or any Blocky listener port in `config.yml` is privileged, instead of crash-looping at bind time. The image health check (every 30 s, 3 s timeout, 5 s start period, 3 retries) requests `/healthz` on `$PORT` (default `8080`; a leading `:` in `PORT` is tolerated).
+Runtime file permissions (`0555` for binaries and `entrypoint.sh`, `0444` for `config.yml`) are set in the builder stage and carried over by `COPY --from`, so the runtime stage has no `chmod` layer that would store a second copy of the Blocky binary.
+
+The final Alpine image contains only the gateway binary, the Blocky binary, `config.yml`, `entrypoint.sh`, `ca-certificates`, and the BusyBox `wget` used by the health check, and runs as the unprivileged `app` user — **without `CAP_NET_BIND_SERVICE`, so no listener may use a port below 1024**. `config.yml` pins Blocky to loopback ports `5353`/`8053` exactly so Blocky never binds its default `:53` (which would fail with `listen udp :53: bind: permission denied`); `entrypoint.sh` additionally refuses to start with a clear, naming error if `PORT` or any Blocky listener port in `config.yml` (trailing YAML comments are ignored) is privileged, instead of crash-looping at bind time. The image health check (every 30 s, 3 s timeout, 5 s start period, 3 retries) requests `/healthz` on `$PORT` (default `8080`; a leading `:` in `PORT` is tolerated).
 
 Example endpoint after a custom domain is attached:
 
@@ -58,11 +60,11 @@ The `/healthz` endpoint (`GET`/`HEAD`) returns `200` only when a TCP connection 
 
 The gateway accepts RFC-style DoH GET and POST requests on `/dns-query`:
 
-- GET `dns=` values are decoded as unpadded base64url and forwarded internally as bounded POST requests. Padded values are rejected with `400`.
-- GET query strings longer than `dns=` plus the base64url-encoded form of 8,192 bytes (10,924 characters) — 10,928 characters total — are rejected with `413` before the query string is parsed at all. This single bound also caps the `dns=` value, so no decoded message can exceed 8,192 bytes. `HEAD` and any method other than `GET`/`POST`/`OPTIONS` receives `405`.
+- GET `dns=` values are decoded as canonical, unpadded base64url and forwarded internally as bounded POST requests. Padding, characters outside the base64url alphabet, embedded CR/LF, non-canonical trailing bits, malformed query escapes, and duplicate `dns` parameters are rejected with `400`.
+- GET query strings longer than `dns=` plus the base64url-encoded form of 8,192 bytes (10,923 encoded characters; 10,927 characters including `dns=`) are rejected with `413` before the query string is parsed at all. This single bound also caps the `dns=` value, so no decoded message can exceed 8,192 bytes. `HEAD` and any method other than `GET`/`POST`/`OPTIONS` receives `405`.
 - POST requests require `application/dns-message` and are capped at 8,192 bytes (the gateway's wire-format cap, well under the 65,535-byte DNS maximum).
 - Incoming DNS messages are structurally validated before Blocky is called; exactly one DNS question is required and resource records are capped at 4,096.
-- Upstream responses must be HTTP `200`, use `application/dns-message`, fit the same size bound, have valid DNS wire structure, preserve the request transaction ID, and echo the request's question section (owner name and QTYPE/QCLASS, compression-expanded).
+- Upstream responses must be HTTP `200`, use `application/dns-message` and not declare a body over the size bound (all checked before the body is read, so error bodies are never buffered), fit the same size bound while reading, have valid DNS wire structure, preserve the request transaction ID, opcode and recursion-desired bit, and echo the request's question section (owner name and QTYPE/QCLASS, compression-expanded with label boundaries preserved).
 - Backend response headers are capped at 16 KiB, response bodies at 8,192 bytes, and backend redirects are never followed.
 - The gateway never forwards arbitrary upstream response headers to clients.
 
@@ -76,13 +78,13 @@ This validation is primarily a resource-safety and protocol-correctness guard; i
 |---|---|
 | `200` | Valid, fully verified DNS response from Blocky (`application/dns-message`, `Cache-Control: no-store`, `Access-Control-Allow-Origin: *`). |
 | `204` | `OPTIONS` preflight on `/dns-query`. |
-| `400` | GET without `dns=`, padded or otherwise invalid base64url, unreadable POST body, or a message that fails DNS structural validation. |
+| `400` | GET without `dns=`, with duplicate `dns` parameters or malformed query escapes, padded or otherwise invalid base64url, unreadable POST body, or a message that fails DNS structural validation. |
 | `405` | Method not allowed (`Allow` header is set). |
-| `413` | GET query string over the 10,928-character bound, or POST body over 8,192 bytes. |
+| `413` | GET raw query string over the 10,927-character bound, or POST body over 8,192 bytes. |
 | `415` | POST whose `Content-Type` is not `application/dns-message` (parameters such as `charset` are accepted). |
 | `429` | Client exceeded its sliding window; `Retry-After` is 1–60 seconds. |
 | `500` | The gateway could not build the backend request. |
-| `502` | Backend unreachable, or its response failed any verification check (status, content type, size, wire format, transaction ID, question echo). |
+| `502` | Backend unreachable, or its response failed any verification check (status, content type, size, wire format, transaction ID, opcode/RD echo, or question echo). |
 | `503` | Concurrency limit reached, or the client table is full and the client is new. Also `/healthz` when Blocky's listener does not accept a connection. |
 | `504` | Backend request exceeded its 3-second deadline or 2.5-second response-header timeout. |
 
@@ -92,7 +94,7 @@ All gateway-generated error responses are plain text with `Cache-Control: no-sto
 
 - Rate limiting is per exact client IP. IPv6 addresses are intentionally not grouped by prefix in this gateway, so a subscriber that can rotate source addresses inside a routed `/64` can obtain additional windows. The bounded client table is designed to cap memory rather than provide a perfect identity system.
 - `/healthz` is public and is not covered by the rate limiter or the DoH concurrency gate. Its loopback readiness probe is cached for 2 seconds, so repeated health checks do not create a TCP connection storm.
-- With `TRUST_PROXY=true`, a request that carries no valid `X-Forwarded-For` or `X-Real-IP` value is attributed to its TCP peer, which behind a load balancer is the load balancer itself.
+- With `TRUST_PROXY=true`, a request that carries no valid `CF-Connecting-IP`, `X-Forwarded-For`, or `X-Real-IP` value is attributed to its TCP peer, which behind a load balancer is the load balancer itself.
 
 ## Important client-IP setting
 
@@ -102,11 +104,11 @@ For a direct local/container test without a trusted proxy, set `TRUST_PROXY=fals
 
 ## Shutdown behavior
 
-On `SIGINT`/`SIGTERM`, the gateway stops accepting new connections and drains in-flight DoH requests via a graceful HTTP shutdown (up to 5 seconds) before exiting, rather than dropping active requests immediately. `entrypoint.sh` shuts down in order: it first sends `SIGTERM` to the gateway and waits for it to exit, and only then stops Blocky, so Blocky keeps answering while requests drain. If either process exits on its own, the entrypoint stops the other one and exits with the first process's status; a signal-initiated shutdown exits `0`. The entrypoint polls the two processes' exit status once per second, but does so by waiting on a background `sleep`, so `SIGINT`/`SIGTERM` are acted on immediately rather than after the current poll interval. Neither process is given a startup delay: until Blocky is listening, `/healthz` returns `503` and DNS queries return `502`.
+On `SIGINT`/`SIGTERM`, the gateway stops accepting new connections and drains in-flight DoH requests via a graceful HTTP shutdown (up to 5 seconds) before exiting, rather than dropping active requests immediately. `entrypoint.sh` records child exit statuses in a uniquely created, private temporary directory, avoiding PID collisions when multiple instances share a temporary volume. It shuts down in order: it first sends `SIGTERM` to the gateway and waits for it to exit, and only then stops Blocky, so Blocky keeps answering while requests drain. If either process exits on its own, the entrypoint stops the other one and exits with the first process's status; a signal-initiated shutdown exits `0`. The entrypoint polls the two processes' exit status once per second, but does so by waiting on a background `sleep`, so `SIGINT`/`SIGTERM` are acted on immediately rather than after the current poll interval. Neither process is given a startup delay: until Blocky is listening, `/healthz` returns `503` and DNS queries return `502`.
 
 ## Configuration
 
-Environment variables read by the gateway. Unset, empty, non-numeric, below-1 or above-cap values fall back to the default.
+For `RATE_LIMIT`, `MAX_CLIENTS`, and `MAX_CONCURRENT`, unset, empty, non-numeric, below-1, or above-cap values fall back to the listed default. `TRUST_PROXY` also falls back to its safe default (`false` in the binary) when unset, empty, or invalid. `PORT` is different: an empty value selects `8080`, a privileged port is refused by `entrypoint.sh`, and other unusable values cause the gateway to fail at startup.
 
 | Variable | Default | Allowed range | Meaning |
 |---|---|---|---|
@@ -114,7 +116,7 @@ Environment variables read by the gateway. Unset, empty, non-numeric, below-1 or
 | `RATE_LIMIT` | `99` | 1–256 | Requests per client IP per 60-second sliding window. The window length is fixed. |
 | `MAX_CLIENTS` | `8192` | 1–32768 | Maximum client rate-limit states held in memory. |
 | `MAX_CONCURRENT` | `8` | 1–8 | Maximum in-flight DNS requests, including body parsing and backend connections. The default and hard cap are both 8, so the variable can only lower the limit. |
-| `TRUST_PROXY` | `false` in the binary, `true` in the Docker image | `true`/`false` (case-insensitive) | Use `X-Forwarded-For`/`X-Real-IP` for client identity. |
+| `TRUST_PROXY` | `false` in the binary, `true` in the Docker image | `true`/`false` (case-insensitive) | Use `CF-Connecting-IP`, then `X-Forwarded-For`/`X-Real-IP` for client identity. |
 
 The Dockerfile's `ENV` sets `GOMAXPROCS=1`, `GOGC=100`, `GOMEMLIMIT=160MiB`, `RATE_LIMIT=99`, `MAX_CLIENTS=8192`, `MAX_CONCURRENT=8` and `TRUST_PROXY=true`.
 
