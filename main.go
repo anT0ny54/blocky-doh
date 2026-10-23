@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,8 +39,7 @@ const (
 	defaultRate           = 99
 	defaultWindow         = 60 * time.Second
 	defaultMaxClients     = 8192
-	defaultMaxConcurrent  = 8
-	maxConcurrentLimit    = 8
+	defaultMaxConcurrent  = 8 // also the hard cap: MAX_CONCURRENT can only lower it
 	maxRateLimit          = 256
 	maxLimiterClients     = 32768
 	maxDNSBody            = 8192
@@ -51,6 +51,7 @@ const (
 	healthProbeTimeout    = 250 * time.Millisecond
 	healthProbeCacheTTL   = 2 * time.Second
 	evictInterval         = time.Second
+	sweepInterval         = 60 * time.Second
 	logInterval           = 10 * time.Second
 )
 
@@ -64,20 +65,24 @@ const (
 
 type clientState struct {
 	mu    sync.Mutex
-	times []int64
-	seen  int64
+	times []int64 // sorted ascending; times[0] is the oldest, times[len-1] the newest
 }
 
 // limiter.mu must always be acquired before clientState.mu. All current paths
-// preserve that order; adding a path that takes clientState.mu first can
-// deadlock against check/evictStaleLocked/retryAfter.
+// preserve that order; taking clientState.mu first can deadlock against
+// checkWithClock or evictStaleLocked.
 type limiter struct {
-	mu         sync.RWMutex
+	mu         sync.Mutex
 	clients    map[string]*clientState
 	maxClients int
 	rate       int
 	window     time.Duration
-	lastEvict  time.Time
+	// idleTTL is how long a client's newest accepted request must be in the
+	// past before its state may be evicted. It is never shorter than the
+	// window: a client that still has live timestamps must keep its state, or
+	// eviction would reset its budget.
+	idleTTL   time.Duration
+	lastEvict time.Time
 }
 
 func newLimiter(rate int, window time.Duration, maxClients int) *limiter {
@@ -94,10 +99,18 @@ func newLimiter(rate int, window time.Duration, maxClients int) *limiter {
 		maxClients: maxClients,
 		rate:       rate,
 		window:     window,
+		idleTTL:    max(clientIdleTTL, window),
 	}
 }
-func (l *limiter) check(ip string, now time.Time) limitResult {
-	cutoff := now.Add(-l.window).UnixNano()
+
+// check samples the request time after acquiring per-client state, then
+// snapshots any retry delay before releasing that state lock. This keeps
+// concurrent requests for one client in the same order as their window updates.
+func (l *limiter) check(ip string) (limitResult, time.Duration) {
+	return l.checkWithClock(ip, time.Now)
+}
+
+func (l *limiter) checkWithClock(ip string, nowFunc func() time.Time) (limitResult, time.Duration) {
 	l.mu.Lock()
 	if l.clients == nil {
 		l.clients = make(map[string]*clientState)
@@ -105,6 +118,7 @@ func (l *limiter) check(ip string, now time.Time) limitResult {
 	state := l.clients[ip]
 	if state == nil {
 		if len(l.clients) >= l.maxClients {
+			now := nowFunc()
 			if l.lastEvict.IsZero() || now.Sub(l.lastEvict) >= evictInterval {
 				l.lastEvict = now
 				l.evictStaleLocked(now)
@@ -112,80 +126,75 @@ func (l *limiter) check(ip string, now time.Time) limitResult {
 		}
 		if len(l.clients) >= l.maxClients {
 			l.mu.Unlock()
-			return limitCapacity
+			return limitCapacity, 0
 		}
 		state = &clientState{}
 		l.clients[ip] = state
 	}
 	state.mu.Lock()
 	l.mu.Unlock()
-	kept := state.times[:0]
-	for _, t := range state.times {
-		if t > cutoff {
-			kept = append(kept, t)
-		}
-	}
-	state.times = kept
-	// Refresh liveness for every request, including rejected ones, so a
-	// persistently rate-limited client is not evicted as "idle" while it
-	// is still actively (if unsuccessfully) reaching the gateway.
-	// Requests can capture their timestamps before contending on the limiter
-	// locks, so keep liveness monotonic if an older timestamp is processed later.
-	if seen := now.UnixNano(); seen > state.seen {
-		state.seen = seen
+	now := nowFunc()
+	cutoff := now.Add(-l.window).UnixNano()
+	// Timestamps are kept sorted, so expire the old prefix with a binary
+	// search instead of scanning every request in the client's window.
+	firstLive := sort.Search(len(state.times), func(i int) bool {
+		return state.times[i] > cutoff
+	})
+	if firstLive == len(state.times) {
+		state.times = state.times[:0]
+	} else if firstLive > 0 {
+		// Compact in place to preserve the slice capacity for future arrivals.
+		copy(state.times, state.times[firstLive:])
+		state.times = state.times[:len(state.times)-firstLive]
 	}
 	if len(state.times) >= l.rate {
+		retryAfter := retryAfterDuration(state.times[0], now, l.window)
 		state.mu.Unlock()
-		return limitRateLimited
+		return limitRateLimited, retryAfter
 	}
-	state.times = append(state.times, now.UnixNano())
+	ts := now.UnixNano()
+	// The production clock is sampled while the client lock is held, so
+	// ordinary arrivals append at the end. Keep the slice sorted as a fallback
+	// for clock regressions and deterministic out-of-order test timestamps.
+	if len(state.times) == 0 || ts >= state.times[len(state.times)-1] {
+		state.times = append(state.times, ts)
+	} else {
+		index := sort.Search(len(state.times), func(i int) bool {
+			return state.times[i] >= ts
+		})
+		state.times = append(state.times, 0)
+		copy(state.times[index+1:], state.times[index:len(state.times)-1])
+		state.times[index] = ts
+	}
 	state.mu.Unlock()
-	return limitAllowed
+	return limitAllowed, 0
 }
+
 func (l *limiter) evictStaleLocked(now time.Time) {
-	cutoff := now.Add(-clientIdleTTL).UnixNano()
+	cutoff := now.Add(-l.idleTTL).UnixNano()
 	for ip, state := range l.clients {
 		state.mu.Lock()
-		stale := state.seen == 0 || state.seen < cutoff
+		// Timestamps are sorted, so the last one is the newest. A client with
+		// any live timestamp is newer than the cutoff because idleTTL >= window,
+		// so eviction can never reset a live budget.
+		stale := len(state.times) == 0 || state.times[len(state.times)-1] < cutoff
 		state.mu.Unlock()
 		if stale {
 			delete(l.clients, ip)
 		}
 	}
 }
-func (l *limiter) retryAfter(ip string, now time.Time) time.Duration {
-	l.mu.RLock()
-	state := l.clients[ip]
-	if state == nil {
-		l.mu.RUnlock()
-		return time.Second
-	}
-	state.mu.Lock()
-	l.mu.RUnlock()
-	defer state.mu.Unlock()
-	if len(state.times) == 0 {
-		return time.Second
-	}
-	// Requests timestamp themselves before entering the limiter, so concurrent
-	// callers may append timestamps out of chronological order. Find the true
-	// oldest request instead of assuming the first slice element is oldest.
-	oldest := state.times[0]
-	for _, timestamp := range state.times[1:] {
-		if timestamp < oldest {
-			oldest = timestamp
-		}
-	}
-	if wait := time.Unix(0, oldest).Add(l.window).Sub(now); wait > time.Second {
-		return wait
-	}
-	return time.Second
+
+func retryAfterDuration(oldest int64, now time.Time, window time.Duration) time.Duration {
+	wait := time.Unix(0, oldest).Add(window).Sub(now)
+	// A clock regression or deterministic test can put an older timestamp after
+	// a newer observation. Never advertise a wait longer than the configured
+	// window, and never less than one second.
+	return max(time.Second, min(wait, max(window, time.Second)))
 }
+
 func retryAfterSeconds(d time.Duration) int {
-	secs := int((d + time.Second - 1) / time.Second)
-	if secs < 1 {
-		return 1
-	}
-	return secs
+	return max(1, int((d+time.Second-1)/time.Second))
 }
 
 type logGate struct {
@@ -206,14 +215,16 @@ func (g *logGate) allow(now time.Time) (int64, bool) {
 	g.suppressed = 0
 	return n, true
 }
+
 func suppressedNote(n int64) string {
 	if n == 0 {
 		return ""
 	}
 	return fmt.Sprintf(" (%d similar messages suppressed)", n)
 }
+
 func (l *limiter) cleanup(ctx context.Context) {
-	ticker := time.NewTicker(60 * time.Second)
+	ticker := time.NewTicker(sweepInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -255,6 +266,7 @@ func parseEnvInt(name string, def, upper int) int {
 	}
 	return n
 }
+
 func parseEnvBool(name string, def bool) bool {
 	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
@@ -269,6 +281,7 @@ func parseEnvBool(name string, def bool) bool {
 		return def
 	}
 }
+
 func clientIP(r *http.Request, trustProxy bool) string {
 	parse := func(value string) string {
 		ip := net.ParseIP(strings.Trim(strings.TrimSpace(value), "[]"))
@@ -284,8 +297,11 @@ func clientIP(r *http.Request, trustProxy bool) string {
 		if ip := parse(r.Header.Get("CF-Connecting-IP")); ip != "" {
 			return ip
 		}
-		if xff := strings.Join(r.Header.Values("X-Forwarded-For"), ","); xff != "" {
-			for _, part := range strings.Split(xff, ",") {
+		for _, value := range r.Header.Values("X-Forwarded-For") {
+			// strings.Cut walks the list without allocating a slice per request.
+			for value != "" {
+				var part string
+				part, value, _ = strings.Cut(value, ",")
 				if ip := parse(part); ip != "" {
 					return ip
 				}
@@ -304,6 +320,7 @@ func clientIP(r *http.Request, trustProxy bool) string {
 	}
 	return host
 }
+
 func (s *server) backendReady() bool {
 	s.probeMu.Lock()
 	defer s.probeMu.Unlock()
@@ -336,10 +353,12 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	}
 }
+
 func writeGatewayError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Cache-Control", "no-store")
 	http.Error(w, msg, code)
 }
+
 func decodeDoHQuery(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	if r.Method == http.MethodGet {
 		// Reject oversized query strings before parsing them. The dns=
@@ -363,14 +382,11 @@ func decodeDoHQuery(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 			return nil, errInvalidDNSParameter
 		}
 		encoded := dnsValues[0]
-		// Go's base64 decoder ignores CR/LF, but DoH GET encoding must be a
-		// single unpadded base64url token. Reject non-alphabet bytes explicitly.
-		for i := 0; i < len(encoded); i++ {
-			c := encoded[i]
-			if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-				(c >= '0' && c <= '9') || c == '-' || c == '_') {
-				return nil, errInvalidDNSParameter
-			}
+		// The strict decoder rejects padding and every byte outside the base64url
+		// alphabet except CR/LF, which it silently skips; a DoH GET value must be
+		// a single unpadded token, so refuse those two explicitly.
+		if strings.ContainsAny(encoded, "\r\n") {
+			return nil, errInvalidDNSParameter
 		}
 		decoded, err := strictRawURLEncoding.DecodeString(encoded)
 		if err != nil {
@@ -380,6 +396,9 @@ func decodeDoHQuery(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	}
 	if !validContentType(r.Header.Get("Content-Type")) {
 		return nil, errInvalidContentType
+	}
+	if r.ContentLength > maxDNSBody {
+		return nil, errDNSMessageTooLarge
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxDNSBody)
 	body, err := io.ReadAll(r.Body)
@@ -397,8 +416,9 @@ func decodeDoHQuery(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 // returns the offset of the first byte after it at its original position. When
 // canonical is non-nil, an unambiguous, ASCII-case-folded wire name is appended
 // so equality checks preserve label boundaries instead of joining labels with dots.
-// Compression pointers must point strictly backwards and past the header, and
-// both the number of pointer hops and the expanded wire length are bounded.
+// Compression pointers must point strictly backwards (so always inside the
+// message) and past the header, and both the number of pointer hops and the
+// expanded wire length are bounded.
 func walkDNSName(message []byte, offset int, canonical *[]byte) (int, error) {
 	if offset < 0 || offset >= len(message) {
 		return 0, errors.New("dns name offset out of bounds")
@@ -418,7 +438,7 @@ func walkDNSName(message []byte, offset int, canonical *[]byte) (int, error) {
 				return 0, errors.New("truncated dns compression pointer")
 			}
 			pointer := ((length & 0x3f) << 8) | int(message[pos+1])
-			if pointer < 12 || pointer >= len(message) || pointer >= pos {
+			if pointer < 12 || pointer >= pos {
 				return 0, errors.New("invalid dns compression pointer")
 			}
 			if next < 0 {
@@ -444,9 +464,6 @@ func walkDNSName(message []byte, offset int, canonical *[]byte) (int, error) {
 				}
 				return next, nil
 			}
-			if length > 63 {
-				return 0, errors.New("dns label too long")
-			}
 			if pos+length > len(message) {
 				return 0, errors.New("truncated dns label")
 			}
@@ -471,23 +488,35 @@ func walkDNSName(message []byte, offset int, canonical *[]byte) (int, error) {
 		}
 	}
 }
+
 func skipDNSName(message []byte, offset int) (int, error) {
 	return walkDNSName(message, offset, nil)
 }
-func expandDNSNameCanonical(message []byte, offset int) ([]byte, int, error) {
-	canonical := make([]byte, 0, maxDNSNameLength)
-	end, err := walkDNSName(message, offset, &canonical)
-	if err != nil {
-		return nil, 0, err
-	}
-	return canonical, end, nil
+
+// canonicalNameBufPool recycles the scratch buffers used to build canonical
+// wire names, avoiding a fresh allocation per DNS question comparison.
+var canonicalNameBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 0, maxDNSNameLength)
+		return &buf
+	},
 }
+
 func dnsQuestionEqual(query, response []byte) bool {
-	qName, qEnd, err := expandDNSNameCanonical(query, 12)
+	qBuf := canonicalNameBufPool.Get().(*[]byte)
+	rBuf := canonicalNameBufPool.Get().(*[]byte)
+	qName := (*qBuf)[:0]
+	rName := (*rBuf)[:0]
+	defer func() {
+		*qBuf, *rBuf = qName, rName
+		canonicalNameBufPool.Put(qBuf)
+		canonicalNameBufPool.Put(rBuf)
+	}()
+	qEnd, err := walkDNSName(query, 12, &qName)
 	if err != nil {
 		return false
 	}
-	rName, rEnd, err := expandDNSNameCanonical(response, 12)
+	rEnd, err := walkDNSName(response, 12, &rName)
 	if err != nil {
 		return false
 	}
@@ -496,6 +525,7 @@ func dnsQuestionEqual(query, response []byte) bool {
 	}
 	return bytes.Equal(query[qEnd:qEnd+4], response[rEnd:rEnd+4])
 }
+
 func validateDNSMessage(message []byte, response bool) error {
 	if len(message) < 12 {
 		return errors.New("dns message too short")
@@ -550,10 +580,12 @@ func validateDNSMessage(message []byte, response bool) error {
 	}
 	return nil
 }
+
 func validContentType(value string) bool {
 	mediaType, _, err := mime.ParseMediaType(value)
 	return err == nil && strings.EqualFold(mediaType, "application/dns-message")
 }
+
 func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -569,11 +601,21 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	}
 	select {
 	case s.concurrent <- struct{}{}:
-		defer func() { <-s.concurrent }()
 	default:
 		writeGatewayError(w, http.StatusServiceUnavailable, "server busy")
 		return
 	}
+	// The slot covers parsing and upstream work only. It is released as soon
+	// as the response is verified (and on every early return), so a client
+	// that reads slowly cannot pin one of the few slots while its reply drains.
+	slotHeld := true
+	releaseSlot := func() {
+		if slotHeld {
+			slotHeld = false
+			<-s.concurrent
+		}
+	}
+	defer releaseSlot()
 	query, err := decodeDoHQuery(w, r)
 	if err != nil {
 		if errors.Is(err, errInvalidContentType) {
@@ -591,17 +633,19 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, http.StatusBadRequest, "invalid dns message")
 		return
 	}
-	// The rate-limit budget is charged only after body validation, so malformed requests do not consume a client's window; the concurrency gate above still bounds body parsing and upstream work.
+	// The rate-limit budget is charged only after body validation, so malformed
+	// requests do not consume a client's window; the concurrency gate above
+	// still bounds body parsing and upstream work.
 	ip := clientIP(r, s.trustProxy)
-	now := time.Now()
-	switch s.limiter.check(ip, now) {
+	decision, retryAfter := s.limiter.check(ip)
+	switch decision {
 	case limitAllowed:
 	case limitRateLimited:
-		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(s.limiter.retryAfter(ip, time.Now()))))
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(retryAfter)))
 		writeGatewayError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	default:
-		if n, ok := s.capacityLog.allow(now); ok {
+		if n, ok := s.capacityLog.allow(time.Now()); ok {
 			log.Printf("client limiter at capacity (%d states); rejecting new clients%s", s.limiter.maxClients, suppressedNote(n))
 		}
 		writeGatewayError(w, http.StatusServiceUnavailable, "server busy")
@@ -663,12 +707,17 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, http.StatusBadGateway, "upstream DNS response question mismatch")
 		return
 	}
+	releaseSlot()
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/dns-message")
+	// Explicit length avoids chunked encoding for responses over Go's 2 KiB
+	// auto-length threshold.
+	w.Header().Set("Content-Length", strconv.Itoa(len(responseBody)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(responseBody)
 }
+
 func (s *server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.health)
@@ -678,6 +727,7 @@ func (s *server) routes() *http.ServeMux {
 	})
 	return mux
 }
+
 func main() {
 	port := strings.TrimSpace(os.Getenv("PORT"))
 	if port == "" {
@@ -688,7 +738,7 @@ func main() {
 	}
 	rate := parseEnvInt("RATE_LIMIT", defaultRate, maxRateLimit)
 	maxClients := parseEnvInt("MAX_CLIENTS", defaultMaxClients, maxLimiterClients)
-	maxConcurrent := parseEnvInt("MAX_CONCURRENT", defaultMaxConcurrent, maxConcurrentLimit)
+	maxConcurrent := parseEnvInt("MAX_CONCURRENT", defaultMaxConcurrent, defaultMaxConcurrent)
 	trustProxy := parseEnvBool("TRUST_PROXY", false)
 	lim := newLimiter(rate, defaultWindow, maxClients)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -735,7 +785,7 @@ func main() {
 	select {
 	case err := <-serveErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal(fmt.Errorf("listen: %w", err))
+			log.Fatalf("listen: %v", err)
 		}
 	case sig := <-sigCh:
 		log.Printf("received %s; draining in-flight requests", sig)

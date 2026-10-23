@@ -31,7 +31,11 @@ Internet / SnapDeploy HTTPS
 
 The exact **99 requests / 60 seconds / client IP** policy is deliberately kept in the gateway rather than delegated to Blocky, so the policy remains independent of Blocky release changes.
 
-The limiter is a **strict sliding window**: at most 99 requests per client IP fall inside any rolling 60-second span. There is no token refill — after a full 99-request burst, further requests are admitted only as earlier timestamps age out of the window. Two rejection modes are distinguished: an over-budget client receives `429` with a `Retry-After` header holding the whole seconds until its oldest request leaves the window (at most 60), while a new client arriving when the fixed client table is full receives `503`, so capacity exhaustion is not mistaken for per-client throttling. Client states idle for more than 2 minutes are evicted by a 60-second background sweep and, when the table is full, by an on-demand scan that runs at most once per second; live states are never evicted to admit a new client. Rejected requests — including rate-limited ones — still refresh a client's liveness timestamp, so a persistently throttled client is not evicted as idle. The rate budget is charged only after a request passes body validation and the concurrency gate, so malformed or over-capacity requests never consume a client's window. Client identities are normalized with `net.IP.String()`, so an IPv6 client cannot occupy multiple limiter states via alternate textual encodings of the same address.
+The limiter is a **strict sliding window**: at most 99 requests per client IP fall inside any rolling 60-second span. There is no token refill — after a full 99-request burst, further requests are admitted only as earlier timestamps age out of the window. Two rejection modes are distinguished: an over-budget client receives `429` with a `Retry-After` header holding the whole seconds until its oldest request leaves the window (at most 60), while a new client arriving when the fixed client table is full receives `503`, so capacity exhaustion is not mistaken for per-client throttling.
+
+Client states whose newest accepted request is more than 2 minutes old — or older than the window, if the window is longer than that — are evicted by a 60-second background sweep and, when the table is full, by an on-demand scan that runs at most once per second. Because the idle threshold is never shorter than the window, a state is never evicted while it still holds live timestamps, so eviction cannot reset a client's budget; live states are also never evicted to admit a new client. Liveness is derived from the newest stored timestamp, so a throttled client keeps its state for exactly as long as its budget is in use and no separate liveness field is tracked. The rate budget is charged only after a request passes body validation and the concurrency gate, so malformed or over-capacity requests never consume a client's window. Client identities are normalized with `net.IP.String()`, so an IPv6 client cannot occupy multiple limiter states via alternate textual encodings of the same address.
+
+The limiter samples each request timestamp after acquiring the client-state lock, so concurrent requests for one IP are ordered with their window updates. The `Retry-After` delay is calculated from that same timestamp and the oldest in-window timestamp snapshot before the lock is released; later requests cannot change a rejection's delay, and the value is capped at the configured window as a defensive bound. Timestamps remain ordered, so expired entries are skipped with a binary search and the oldest request is available in O(1).
 
 The `/dns-query` path is implemented by `doh-gateway`, which answers `OPTIONS` preflights (`204`) and sets `Access-Control-Allow-Origin: *` on preflights and successful DNS responses. Methods other than `GET`, `POST` and `OPTIONS` receive `405`. Blocky v0.35.0 supports DoH itself, but this project intentionally keeps every Blocky listener on loopback and serves `/dns-query` through the resource-bounded gateway instead. Blocky's loopback HTTP listener also exposes its own REST API and pprof endpoints; the gateway never proxies them, because it only ever forwards DNS messages to `/dns-query`.
 
@@ -62,7 +66,7 @@ The gateway accepts RFC-style DoH GET and POST requests on `/dns-query`:
 
 - GET `dns=` values are decoded as canonical, unpadded base64url and forwarded internally as bounded POST requests. Padding, characters outside the base64url alphabet, embedded CR/LF, non-canonical trailing bits, malformed query escapes, and duplicate `dns` parameters are rejected with `400`.
 - GET query strings longer than `dns=` plus the base64url-encoded form of 8,192 bytes (10,923 encoded characters; 10,927 characters including `dns=`) are rejected with `413` before the query string is parsed at all. This single bound also caps the `dns=` value, so no decoded message can exceed 8,192 bytes. `HEAD` and any method other than `GET`/`POST`/`OPTIONS` receives `405`.
-- POST requests require `application/dns-message` and are capped at 8,192 bytes (the gateway's wire-format cap, well under the 65,535-byte DNS maximum).
+- POST requests require `application/dns-message` and are capped at 8,192 bytes (the gateway's wire-format cap, well under the 65,535-byte DNS maximum). A declared `Content-Length` over the cap is rejected before reading the body; streaming bodies are bounded while being read.
 - Incoming DNS messages are structurally validated before Blocky is called; exactly one DNS question is required and resource records are capped at 4,096.
 - Upstream responses must be HTTP `200`, use `application/dns-message` and not declare a body over the size bound (all checked before the body is read, so error bodies are never buffered), fit the same size bound while reading, have valid DNS wire structure, preserve the request transaction ID, opcode and recursion-desired bit, and echo the request's question section (owner name and QTYPE/QCLASS, compression-expanded with label boundaries preserved).
 - Backend response headers are capped at 16 KiB, response bodies at 8,192 bytes, and backend redirects are never followed.
@@ -72,11 +76,11 @@ This validation is primarily a resource-safety and protocol-correctness guard; i
 
 ### Request order and status codes
 
-`/dns-query` requests are checked in this order, and the first failing check decides the response: HTTP method, then the concurrency gate, then body/query decoding and size, then DNS wire-format validation, then the per-client rate limiter, and finally the backend call. The concurrency gate is intentionally before parsing so malformed or oversized request floods cannot consume unbounded CPU or memory outside the configured in-flight budget. The rate budget is charged only after DNS validation, so malformed requests do not consume a client window.
+`/dns-query` requests are checked in this order, and the first failing check decides the response: HTTP method, then the concurrency gate, then body/query decoding and size, then DNS wire-format validation, then the per-client rate limiter, and finally the backend call. The concurrency gate is intentionally before parsing so malformed or oversized request floods cannot consume unbounded CPU or memory outside the configured in-flight budget. The gate slot is released as soon as the upstream answer has been verified, before the response is written to the client, so a slow-reading client cannot hold one of the few slots while its reply drains. The rate budget is charged only after DNS validation, so malformed requests do not consume a client window.
 
 | Status | When |
 |---|---|
-| `200` | Valid, fully verified DNS response from Blocky (`application/dns-message`, `Cache-Control: no-store`, `Access-Control-Allow-Origin: *`). |
+| `200` | Valid, fully verified DNS response from Blocky (`application/dns-message`, explicit `Content-Length`, `Cache-Control: no-store`, `Access-Control-Allow-Origin: *`). |
 | `204` | `OPTIONS` preflight on `/dns-query`. |
 | `400` | GET without `dns=`, with duplicate `dns` parameters or malformed query escapes, padded or otherwise invalid base64url, unreadable POST body, or a message that fails DNS structural validation. |
 | `405` | Method not allowed (`Allow` header is set). |
@@ -94,6 +98,7 @@ All gateway-generated error responses are plain text with `Cache-Control: no-sto
 
 - Rate limiting is per exact client IP. IPv6 addresses are intentionally not grouped by prefix in this gateway, so a subscriber that can rotate source addresses inside a routed `/64` can obtain additional windows. The bounded client table is designed to cap memory rather than provide a perfect identity system.
 - `/healthz` is public and is not covered by the rate limiter or the DoH concurrency gate. Its loopback readiness probe is cached for 2 seconds, so repeated health checks do not create a TCP connection storm.
+- With `TRUST_PROXY=true`, the client identity comes from request headers. If the edge does not overwrite or strip a client-supplied `CF-Connecting-IP`, `X-Forwarded-For` or `X-Real-IP`, a client can choose its own limiter identity: it can bypass the per-IP budget and fill the client table so that new clients receive `503`. Verify the platform's header handling before relying on the limit, and use `TRUST_PROXY=false` on any directly reachable port.
 - With `TRUST_PROXY=true`, a request that carries no valid `CF-Connecting-IP`, `X-Forwarded-For`, or `X-Real-IP` value is attributed to its TCP peer, which behind a load balancer is the load balancer itself.
 
 ## Important client-IP setting
@@ -115,10 +120,10 @@ For `RATE_LIMIT`, `MAX_CLIENTS`, and `MAX_CONCURRENT`, unset, empty, non-numeric
 | `PORT` | `8080` | TCP port number | Public listener port (a leading `:` is accepted). The gateway itself does not range-check it; `entrypoint.sh` refuses to start if it names a privileged port (<1024), and any other unusable value makes the gateway exit at startup. |
 | `RATE_LIMIT` | `99` | 1–256 | Requests per client IP per 60-second sliding window. The window length is fixed. |
 | `MAX_CLIENTS` | `8192` | 1–32768 | Maximum client rate-limit states held in memory. |
-| `MAX_CONCURRENT` | `8` | 1–8 | Maximum in-flight DNS requests, including body parsing and backend connections. The default and hard cap are both 8, so the variable can only lower the limit. |
+| `MAX_CONCURRENT` | `8` | 1–8 | Maximum in-flight DNS requests, covering body parsing and backend work (the slot is released before the response is written to the client). The default and hard cap are both 8, so the variable can only lower the limit. |
 | `TRUST_PROXY` | `false` in the binary, `true` in the Docker image | `true`/`false` (case-insensitive) | Use `CF-Connecting-IP`, then `X-Forwarded-For`/`X-Real-IP` for client identity. |
 
-The Dockerfile's `ENV` sets `GOMAXPROCS=1`, `GOGC=100`, `GOMEMLIMIT=160MiB`, `RATE_LIMIT=99`, `MAX_CLIENTS=8192`, `MAX_CONCURRENT=8` and `TRUST_PROXY=true`.
+The Dockerfile's `ENV` sets `GOMAXPROCS=1`, `GOMEMLIMIT=160MiB`, `RATE_LIMIT=99`, `MAX_CLIENTS=8192`, `MAX_CONCURRENT=8` and `TRUST_PROXY=true`. `GOGC` is left at the Go default of `100`.
 
 The Blocky backend address (`127.0.0.1:8053`) is fixed in the gateway and must match `ports.http` in `config.yml`. The Blocky config path (`/etc/blocky/config.yml`) is fixed in `entrypoint.sh`.
 
@@ -159,7 +164,7 @@ docker build -t blocky-doh .
 docker run --rm -p 8080:8080 -e TRUST_PROXY=false blocky-doh
 ```
 
-To run the unit tests without Docker, use `go vet ./... && go test ./...` (Go 1.27 or newer).
+To run the unit tests without Docker, use `go vet ./... && go test ./...` (Go 1.27 or newer; add `-race` where cgo is available). The suite covers decode and validation rejection paths (including CR/LF smuggled into the `dns=` value), both declared and streaming oversized POST bodies, mid-read POST failures (`failed to read dns message`, surfaced as `400`), out-of-order limiter timestamps, bounded `Retry-After` responses, idle-state eviction relative to the window, concurrency-slot release, and the explicit response `Content-Length`. `entrypoint.sh` is kept clean under `shellcheck -s sh entrypoint.sh`.
 
 `docker-compose.yml` (service `hagezi-doh`, port `8080:8080`, `restart: unless-stopped`) pins `TRUST_PROXY=false` for the same reason: a plain local compose setup has no trusted load balancer in front, so forwarded headers must be ignored.
 
@@ -194,14 +199,21 @@ This project is a DNS resolver/DoH service, not a general-purpose HTTP/SOCKS pro
 | `entrypoint.sh` | Starts and supervises Blocky and the gateway; refuses privileged ports (<1024) up front. |
 | `config.yml` | Blocky configuration. |
 | `docker-compose.yml` | Local run with `TRUST_PROXY=false`. |
-| `CHANGELOG.md` | Change history and code-audit notes. |
+| `.dockerignore` | Deny-by-default allow-list: only the files the Dockerfile `COPY`s (`go.mod`, `main.go`, `main_test.go`, `config.yml`, `entrypoint.sh`) enter the build context, so unrelated edits never invalidate the build cache. |
+| `.github/workflows/Keep-Alive.yml` | Scheduled workflow that refreshes `keep-alive.txt` so an inactive fork remains eligible for scheduled GitHub Actions. |
+| `keep-alive.txt` | Timestamp refreshed by the keep-alive workflow. |
+| `CHANGELOG.md` | Notes for the latest modification set. |
 | `LICENSE` | License text. |
 
 ## Changelog
 
-See [`CHANGELOG.md`](CHANGELOG.md) for the full change history and code-audit notes.
+See [`CHANGELOG.md`](CHANGELOG.md) for the notes on the latest modification set.
 
-## 🌐 Free DNS Services
+## 🔗 Related projects (not part of this repository)
+
+The services below are maintained separately and are **not** part of this repository, its build pipeline, or its release cycle. They are listed here for convenience only.
+
+### 🌐 Free DNS Services
 
 High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 
@@ -214,7 +226,7 @@ High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 | Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` |
 | Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` |
 
-## ⚡ Bandwidth Hero Server
+### ⚡ Bandwidth Hero Server
 
 A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
 

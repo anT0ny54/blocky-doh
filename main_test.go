@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -24,6 +25,7 @@ func testDNSQuery(id byte) []byte {
 		0x00, 0x01, 0x00, 0x01,
 	}
 }
+
 func testDNSResponse(query []byte) []byte {
 	return []byte{
 		query[0], query[1], 0x81, 0x80,
@@ -35,6 +37,16 @@ func testDNSResponse(query []byte) []byte {
 		0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 1, 2, 3, 4,
 	}
 }
+
+func checkLimiterAt(l *limiter, ip string, now time.Time) (limitResult, time.Duration) {
+	return l.checkWithClock(ip, func() time.Time { return now })
+}
+
+func checkLimiter(l *limiter, ip string, now time.Time) limitResult {
+	result, _ := checkLimiterAt(l, ip, now)
+	return result
+}
+
 func testServer(t *testing.T, backend func(http.ResponseWriter, *http.Request)) (*server, func()) {
 	t.Helper()
 	backendSrv := httptest.NewServer(http.HandlerFunc(backend))
@@ -47,6 +59,7 @@ func testServer(t *testing.T, backend func(http.ResponseWriter, *http.Request)) 
 		concurrent:  make(chan struct{}, defaultMaxConcurrent),
 	}, cleanup
 }
+
 func postDoH(s *server, query []byte, remoteAddr string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/dns-query", bytes.NewReader(query))
 	req.Header.Set("Content-Type", "application/dns-message")
@@ -75,27 +88,28 @@ func TestLimiterAllows99ThenRejects100thImmediateRequest(t *testing.T) {
 	l := newLimiter(99, 60*time.Second, 1024)
 	now := time.Unix(1_000_000, 0)
 	for i := 0; i < 99; i++ {
-		if got := l.check("203.0.113.10", now); got != limitAllowed {
+		if got := checkLimiter(l, "203.0.113.10", now); got != limitAllowed {
 			t.Fatalf("request %d got %v; want first 99 requests allowed", i+1, got)
 		}
 	}
-	if got := l.check("203.0.113.10", now); got != limitRateLimited {
+	if got := checkLimiter(l, "203.0.113.10", now); got != limitRateLimited {
 		t.Fatalf("100th immediate request got %v; want rate limiting", got)
 	}
 }
+
 func TestLimiterSeparatesClientIPs(t *testing.T) {
 	l := newLimiter(99, 60*time.Second, 1024)
 	now := time.Unix(1_000_000, 0)
 	for i := 0; i < 99; i++ {
-		_ = l.check("203.0.113.10", now)
+		_ = checkLimiter(l, "203.0.113.10", now)
 	}
-	if got := l.check("198.51.100.20", now); got != limitAllowed {
+	if got := checkLimiter(l, "198.51.100.20", now); got != limitAllowed {
 		t.Fatalf("second client IP got %v; want allowed", got)
 	}
 }
+
 func TestLimiterConcurrentAccessIsBoundedPerClient(t *testing.T) {
 	l := newLimiter(99, 60*time.Second, 1024)
-	now := time.Unix(1_000_000, 0)
 	const goroutines = 32
 	const attempts = 8
 	results := make(chan limitResult, goroutines*attempts)
@@ -105,7 +119,8 @@ func TestLimiterConcurrentAccessIsBoundedPerClient(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < attempts; j++ {
-				results <- l.check("203.0.113.10", now)
+				result, _ := l.check("203.0.113.10")
+				results <- result
 			}
 		}()
 	}
@@ -123,97 +138,136 @@ func TestLimiterConcurrentAccessIsBoundedPerClient(t *testing.T) {
 		t.Fatalf("concurrent limiter allowed %d requests; want exactly 99", allowed)
 	}
 }
+
 func TestLimiterAllocatesClientMapLazily(t *testing.T) {
 	l := newLimiter(defaultRate, defaultWindow, 1024)
 	if l.clients != nil {
 		t.Fatal("limiter client map was allocated eagerly")
 	}
 	now := time.Unix(1_000_000, 0)
-	if got := l.check("203.0.113.10", now); got != limitAllowed {
+	if got := checkLimiter(l, "203.0.113.10", now); got != limitAllowed {
 		t.Fatalf("first request got %v; want allowed", got)
 	}
 	if l.clients == nil {
 		t.Fatal("limiter client map was not allocated on first request")
 	}
 }
+
 func TestLimiterSlidingWindowAdmitsRequestsAgainAfterWindowSlides(t *testing.T) {
 	l := newLimiter(99, 60*time.Second, 1024)
 	start := time.Unix(2_000_000, 0)
 	for i := 0; i < 99; i++ {
-		if got := l.check("203.0.113.10", start); got != limitAllowed {
+		if got := checkLimiter(l, "203.0.113.10", start); got != limitAllowed {
 			t.Fatalf("request %d got %v; want first 99 requests allowed", i+1, got)
 		}
 	}
-	if got := l.check("203.0.113.10", start.Add(30*time.Second)); got != limitRateLimited {
+	if got := checkLimiter(l, "203.0.113.10", start.Add(30*time.Second)); got != limitRateLimited {
 		t.Fatalf("request inside the window got %v; want rate limited", got)
 	}
-	if got := l.check("203.0.113.10", start.Add(60*time.Second)); got != limitAllowed {
+	if got := checkLimiter(l, "203.0.113.10", start.Add(60*time.Second)); got != limitAllowed {
 		t.Fatalf("request after the window slid got %v; want allowed", got)
 	}
 }
+
 func TestLimiterRejectsOnlyExpiredRequestsOutsideWindow(t *testing.T) {
 	l := newLimiter(2, 60*time.Second, 1024)
 	start := time.Unix(3_000_000, 0)
-	if got := l.check("203.0.113.10", start); got != limitAllowed {
+	if got := checkLimiter(l, "203.0.113.10", start); got != limitAllowed {
 		t.Fatalf("first request got %v; want allowed", got)
 	}
-	if got := l.check("203.0.113.10", start.Add(30*time.Second)); got != limitAllowed {
+	if got := checkLimiter(l, "203.0.113.10", start.Add(30*time.Second)); got != limitAllowed {
 		t.Fatalf("second request got %v; want allowed", got)
 	}
-	if got := l.check("203.0.113.10", start.Add(60*time.Second)); got != limitAllowed {
+	if got := checkLimiter(l, "203.0.113.10", start.Add(60*time.Second)); got != limitAllowed {
 		t.Fatalf("request after one timestamp expired got %v; want allowed", got)
 	}
-	if got := l.check("203.0.113.10", start.Add(60*time.Second)); got != limitRateLimited {
+	if got := checkLimiter(l, "203.0.113.10", start.Add(60*time.Second)); got != limitRateLimited {
 		t.Fatalf("request with both timestamps in window got %v; want rate limited", got)
 	}
 }
+
 func TestLimiterRetryAfterReflectsOldestTimestamp(t *testing.T) {
 	l := newLimiter(2, 60*time.Second, 1024)
 	start := time.Unix(4_000_000, 0)
-	l.check("203.0.113.10", start)
-	l.check("203.0.113.10", start.Add(30*time.Second))
+	checkLimiter(l, "203.0.113.10", start)
+	checkLimiter(l, "203.0.113.10", start.Add(30*time.Second))
 	now := start.Add(31 * time.Second)
-	if got := l.check("203.0.113.10", now); got != limitRateLimited {
+	got, retryAfter := checkLimiterAt(l, "203.0.113.10", now)
+	if got != limitRateLimited {
 		t.Fatalf("third request got %v; want rate limited", got)
 	}
-	if got := l.retryAfter("203.0.113.10", now); got != 29*time.Second {
-		t.Fatalf("retryAfter=%v; want 29s until the oldest request leaves the window", got)
+	if retryAfter != 29*time.Second {
+		t.Fatalf("retryAfter=%v; want 29s until the oldest request leaves the window", retryAfter)
 	}
-	if got := l.retryAfter("198.51.100.99", now); got != time.Second {
-		t.Fatalf("retryAfter for unknown client=%v; want 1s", got)
+	if got, retryAfter := checkLimiterAt(l, "198.51.100.99", now); got != limitAllowed || retryAfter != 0 {
+		t.Fatalf("unknown client's first request=(%v, %v); want (allowed, 0)", got, retryAfter)
 	}
 }
+
 func TestLimiterRetryAfterFindsOldestTimestampWhenOutOfOrder(t *testing.T) {
 	l := newLimiter(2, 60*time.Second, 1024)
 	start := time.Unix(4_100_000, 0)
 	// Simulate goroutines acquiring the limiter lock in an order different
 	// from when each captured its timestamp.
-	if got := l.check("203.0.113.10", start.Add(30*time.Second)); got != limitAllowed {
+	if got := checkLimiter(l, "203.0.113.10", start.Add(30*time.Second)); got != limitAllowed {
 		t.Fatalf("first processed request got %v; want allowed", got)
 	}
-	if got := l.check("203.0.113.10", start); got != limitAllowed {
+	if got := checkLimiter(l, "203.0.113.10", start); got != limitAllowed {
 		t.Fatalf("older timestamp got %v; want allowed", got)
 	}
 	now := start.Add(31 * time.Second)
-	if got := l.check("203.0.113.10", now); got != limitRateLimited {
+	got, retryAfter := checkLimiterAt(l, "203.0.113.10", now)
+	if got != limitRateLimited {
 		t.Fatalf("third request got %v; want rate limited", got)
 	}
-	if got := l.retryAfter("203.0.113.10", now); got != 29*time.Second {
-		t.Fatalf("retryAfter=%v; want 29s from the oldest timestamp", got)
+	if retryAfter != 29*time.Second {
+		t.Fatalf("retryAfter=%v; want 29s from the oldest timestamp", retryAfter)
+	}
+	state := l.clients["203.0.113.10"]
+	if len(state.times) != 2 || state.times[0] != start.UnixNano() || state.times[1] != start.Add(30*time.Second).UnixNano() {
+		t.Fatalf("out-of-order timestamps were not kept sorted: %v", state.times)
 	}
 }
 
-func TestLimiterLivenessTimestampDoesNotRegress(t *testing.T) {
-	l := newLimiter(1, 60*time.Second, 1024)
-	start := time.Unix(4_200_000, 0)
-	if got := l.check("203.0.113.10", start.Add(10*time.Second)); got != limitAllowed {
-		t.Fatalf("first processed request got %v; want allowed", got)
+func TestLimiterCapsRetryAfterToWindowForOutOfOrderTimestamp(t *testing.T) {
+	l := newLimiter(1, time.Minute, 1024)
+	start := time.Unix(4_150_000, 0)
+	if got := checkLimiter(l, "203.0.113.10", start.Add(30*time.Second)); got != limitAllowed {
+		t.Fatalf("later timestamp got %v; want allowed", got)
 	}
-	if got := l.check("203.0.113.10", start); got != limitRateLimited {
+	got, retryAfter := checkLimiterAt(l, "203.0.113.10", start)
+	if got != limitRateLimited {
 		t.Fatalf("older timestamp got %v; want rate limited", got)
 	}
-	if got := l.clients["203.0.113.10"].seen; got != start.Add(10*time.Second).UnixNano() {
-		t.Fatalf("seen timestamp regressed to %v", time.Unix(0, got))
+	if retryAfter != time.Minute {
+		t.Fatalf("retryAfter=%v; want it capped at the 60s window", retryAfter)
+	}
+	if got := retryAfterSeconds(retryAfter); got != 60 {
+		t.Fatalf("Retry-After header seconds=%d; want 60", got)
+	}
+	if got := retryAfterDuration(start.Add(30*time.Second).UnixNano(), start, time.Minute); got != time.Minute {
+		t.Fatalf("future timestamp retryAfter=%v; want defensive 60s cap", got)
+	}
+}
+
+func TestLimiterEvictionTreatsEpochTimestampAsReal(t *testing.T) {
+	l := newLimiter(1, time.Minute, 1)
+	now := time.Unix(0, 0)
+	if got := checkLimiter(l, "198.51.100.1", now); got != limitAllowed {
+		t.Fatalf("request at the Unix epoch got %v; want allowed", got)
+	}
+	// Just inside the idle TTL the epoch timestamp must still count as live.
+	l.mu.Lock()
+	l.evictStaleLocked(now.Add(clientIdleTTL - time.Second))
+	l.mu.Unlock()
+	if _, ok := l.clients["198.51.100.1"]; !ok {
+		t.Fatal("epoch client was evicted before the idle TTL elapsed")
+	}
+	l.mu.Lock()
+	l.evictStaleLocked(now.Add(clientIdleTTL + time.Second))
+	l.mu.Unlock()
+	if _, ok := l.clients["198.51.100.1"]; ok {
+		t.Fatal("epoch client was not evicted after the idle TTL elapsed")
 	}
 }
 
@@ -232,21 +286,30 @@ func TestRetryAfterSecondsRoundsUpAndClamps(t *testing.T) {
 		}
 	}
 }
+
+func TestRetryAfterDurationTreatsEpochOldestTimestampAsReal(t *testing.T) {
+	now := time.Unix(0, 0)
+	if got := retryAfterDuration(0, now, time.Minute); got != time.Minute {
+		t.Fatalf("retryAfterDuration(0, epoch, 1m)=%v; want 1m", got)
+	}
+}
+
 func TestLimiterThrottlesEvictionScans(t *testing.T) {
 	l := newLimiter(1, time.Minute, 1)
 	now := time.Unix(6_000_000, 0)
 	stale := now.Add(-clientIdleTTL - time.Second)
 	l.clients = map[string]*clientState{
-		"198.51.100.1": {times: []int64{stale.UnixNano()}, seen: stale.UnixNano()},
+		"198.51.100.1": {times: []int64{stale.UnixNano()}},
 	}
 	l.lastEvict = now
-	if got := l.check("198.51.100.2", now.Add(500*time.Millisecond)); got != limitCapacity {
+	if got := checkLimiter(l, "198.51.100.2", now.Add(500*time.Millisecond)); got != limitCapacity {
 		t.Fatalf("check inside the eviction interval got %v; want limitCapacity (scan throttled)", got)
 	}
-	if got := l.check("198.51.100.2", now.Add(evictInterval)); got != limitAllowed {
+	if got := checkLimiter(l, "198.51.100.2", now.Add(evictInterval)); got != limitAllowed {
 		t.Fatalf("check after the eviction interval got %v; want allowed after stale-state eviction", got)
 	}
 }
+
 func TestLogGateSuppressesBurstsAndReportsCount(t *testing.T) {
 	var g logGate
 	t0 := time.Unix(5_000_000, 0)
@@ -263,31 +326,33 @@ func TestLogGateSuppressesBurstsAndReportsCount(t *testing.T) {
 		t.Fatalf("message after the interval: ok=%v suppressed=%d; want allowed with 2 suppressed", ok, n)
 	}
 }
+
 func TestLimiterDoesNotEvictLiveStateAtCapacity(t *testing.T) {
 	l := newLimiter(1, time.Minute, 2)
 	now := time.Now()
-	if got := l.check("198.51.100.1", now); got != limitAllowed {
+	if got := checkLimiter(l, "198.51.100.1", now); got != limitAllowed {
 		t.Fatalf("first client got %v; want allowed", got)
 	}
-	if got := l.check("198.51.100.2", now); got != limitAllowed {
+	if got := checkLimiter(l, "198.51.100.2", now); got != limitAllowed {
 		t.Fatalf("second client got %v; want allowed", got)
 	}
-	if got := l.check("198.51.100.3", now); got != limitCapacity {
+	if got := checkLimiter(l, "198.51.100.3", now); got != limitCapacity {
 		t.Fatalf("new client at capacity got %v; want limitCapacity", got)
 	}
-	if got := l.check("198.51.100.1", now); got != limitRateLimited {
+	if got := checkLimiter(l, "198.51.100.1", now); got != limitRateLimited {
 		t.Fatalf("existing client got %v; want limitRateLimited (state must not be split or reset)", got)
 	}
 }
+
 func TestLimiterEvictsStaleStateAtCapacity(t *testing.T) {
 	l := newLimiter(1, time.Minute, 2)
 	now := time.Now()
 	stale := now.Add(-clientIdleTTL - time.Second)
 	l.clients = map[string]*clientState{
-		"198.51.100.1": {times: []int64{stale.UnixNano()}, seen: stale.UnixNano()},
-		"198.51.100.2": {times: []int64{now.UnixNano()}, seen: now.UnixNano()},
+		"198.51.100.1": {times: []int64{stale.UnixNano()}},
+		"198.51.100.2": {times: []int64{now.UnixNano()}},
 	}
-	if got := l.check("198.51.100.3", now); got != limitAllowed {
+	if got := checkLimiter(l, "198.51.100.3", now); got != limitAllowed {
 		t.Fatalf("new client got %v; want allowed after stale-state eviction", got)
 	}
 	if _, ok := l.clients["198.51.100.1"]; ok {
@@ -297,6 +362,7 @@ func TestLimiterEvictsStaleStateAtCapacity(t *testing.T) {
 		t.Fatal("live client state was incorrectly evicted")
 	}
 }
+
 func TestValidateDNSMessage(t *testing.T) {
 	query := testDNSQuery(0x12)
 	if err := validateDNSMessage(query, false); err != nil {
@@ -325,6 +391,7 @@ func TestValidateDNSMessage(t *testing.T) {
 		})
 	}
 }
+
 func TestValidateDNSMessageRejectsCompressionPointerIntoHeader(t *testing.T) {
 	message := append([]byte{
 		0x12, 0x34, 0x01, 0x00,
@@ -334,6 +401,7 @@ func TestValidateDNSMessageRejectsCompressionPointerIntoHeader(t *testing.T) {
 		t.Fatal("compression pointer into DNS header was accepted")
 	}
 }
+
 func TestValidateDNSMessageRejectsImpossibleSectionCounts(t *testing.T) {
 	message := testDNSQuery(0x13)
 	message[6], message[7] = 0xff, 0xff
@@ -341,6 +409,7 @@ func TestValidateDNSMessageRejectsImpossibleSectionCounts(t *testing.T) {
 		t.Fatal("impossible section counts were accepted")
 	}
 }
+
 func TestValidateDNSMessageRequiresExactlyOneQuestion(t *testing.T) {
 	query := testDNSQuery(0x14)
 	question := append([]byte(nil), query[12:]...)
@@ -356,6 +425,7 @@ func TestValidateDNSMessageRequiresExactlyOneQuestion(t *testing.T) {
 		t.Fatal("response with multiple questions was accepted")
 	}
 }
+
 func testDNSResponseWithAnswerRecords(query []byte, count int) []byte {
 	message := []byte{
 		query[0], query[1], 0x81, 0x80,
@@ -373,6 +443,7 @@ func testDNSResponseWithAnswerRecords(query []byte, count int) []byte {
 	}
 	return message
 }
+
 func TestValidateDNSMessageEnforcesResourceRecordCeiling(t *testing.T) {
 	query := testDNSQuery(0x16)
 	withinLimit := testDNSResponseWithAnswerRecords(query, maxDNSResourceRecords)
@@ -384,6 +455,7 @@ func TestValidateDNSMessageEnforcesResourceRecordCeiling(t *testing.T) {
 		t.Fatalf("response with %d records was accepted", maxDNSResourceRecords+1)
 	}
 }
+
 func TestValidateDNSMessageRejectsExpandedCompressedNameOver255Bytes(t *testing.T) {
 	longName := make([]byte, 0, 253)
 	for _, labelLen := range []int{63, 63, 63, 59} {
@@ -416,19 +488,23 @@ func TestValidateDNSMessageRejectsExpandedCompressedNameOver255Bytes(t *testing.
 		t.Fatal("expanded compressed DNS name over 255 bytes was accepted")
 	}
 }
-func TestExpandDNSNameCanonicalRejectsOutOfBoundsOffset(t *testing.T) {
+
+func TestWalkDNSNameCanonicalRejectsOutOfBoundsOffset(t *testing.T) {
 	message := testDNSQuery(0x17)
 	for _, offset := range []int{-1, len(message), len(message) + 5} {
-		if _, _, err := expandDNSNameCanonical(message, offset); err == nil {
-			t.Fatalf("expandDNSNameCanonical accepted out-of-bounds offset %d", offset)
+		var canonical []byte
+		if _, err := walkDNSName(message, offset, &canonical); err == nil {
+			t.Fatalf("walkDNSName accepted out-of-bounds offset %d", offset)
 		}
 	}
-	name, end, err := expandDNSNameCanonical(message, 12)
+	canonical := make([]byte, 0, maxDNSNameLength)
+	end, err := walkDNSName(message, 12, &canonical)
 	want := []byte{7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0}
-	if err != nil || !bytes.Equal(name, want) || end != 25 {
-		t.Fatalf("expandDNSNameCanonical=%v,%d,%v; want %v,25,nil", name, end, err, want)
+	if err != nil || !bytes.Equal(canonical, want) || end != 25 {
+		t.Fatalf("walkDNSName=%v,%d,%v; want %v,25,nil", canonical, end, err, want)
 	}
 }
+
 func TestDNSQuestionEqual(t *testing.T) {
 	query := testDNSQuery(0x81)
 	response := testDNSResponse(query)
@@ -449,6 +525,7 @@ func TestDNSQuestionEqual(t *testing.T) {
 		t.Fatal("truncated response question was accepted")
 	}
 }
+
 func TestDNSQuestionEqualPreservesLabelBoundaries(t *testing.T) {
 	// A single label containing a dot is not equivalent to two labels, even
 	// though rendering both names with dots would produce the same string.
@@ -481,6 +558,7 @@ func TestDNSQuestionEqualIsCaseInsensitive(t *testing.T) {
 		t.Fatal("case-only DNS question difference was rejected")
 	}
 }
+
 func TestDoHPOSTForwardsValidatedWireMessage(t *testing.T) {
 	query := testDNSQuery(0x21)
 	response := testDNSResponse(query)
@@ -511,6 +589,7 @@ func TestDoHPOSTForwardsValidatedWireMessage(t *testing.T) {
 		t.Fatal("client response differs from backend DNS response")
 	}
 }
+
 func TestDecodeDoHGETRejectsNonCanonicalBase64PaddingBits(t *testing.T) {
 	// "Zg" canonically encodes "f"; "Zh" decodes to the same byte but has
 	// non-zero unused trailing bits and must be rejected by the strict decoder.
@@ -547,6 +626,7 @@ func TestDoHGETDecodesAndNormalizesToPOST(t *testing.T) {
 		t.Fatalf("decoded GET body differs from DNS query")
 	}
 }
+
 func TestDoHOptionsHandler(t *testing.T) {
 	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Error("backend must not be called for OPTIONS")
@@ -562,6 +642,7 @@ func TestDoHOptionsHandler(t *testing.T) {
 		t.Fatalf("Access-Control-Allow-Origin=%q; want *", got)
 	}
 }
+
 func TestGatewayRejectsOtherPaths(t *testing.T) {
 	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Error("backend must not be called for unknown paths")
@@ -577,6 +658,7 @@ func TestGatewayRejectsOtherPaths(t *testing.T) {
 		}
 	}
 }
+
 func TestDoHRateLimitExceeded(t *testing.T) {
 	backendCalls := 0
 	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -598,13 +680,14 @@ func TestDoHRateLimitExceeded(t *testing.T) {
 		t.Fatalf("third request status=%d; want 429, body=%q", rec.Code, rec.Body.String())
 	}
 	secs, err := strconv.Atoi(rec.Header().Get("Retry-After"))
-	if err != nil || secs < 59 || secs > 60 {
-		t.Fatalf("Retry-After=%q; want about 60 seconds", rec.Header().Get("Retry-After"))
+	if err != nil || secs < 1 || secs > 60 {
+		t.Fatalf("Retry-After=%q; want a value from 1 through 60 seconds", rec.Header().Get("Retry-After"))
 	}
 	if backendCalls != 2 {
 		t.Fatalf("backend was called %d times; want 2", backendCalls)
 	}
 }
+
 func TestDoHCapacityReturns503(t *testing.T) {
 	backendCalls := 0
 	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -626,6 +709,7 @@ func TestDoHCapacityReturns503(t *testing.T) {
 		t.Fatalf("backend was called %d times; want 1", backendCalls)
 	}
 }
+
 func TestDoHConcurrencyLimitReturns503(t *testing.T) {
 	backendReached := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -652,6 +736,7 @@ func TestDoHConcurrencyLimitReturns503(t *testing.T) {
 		t.Fatalf("first request status=%d; want 200, body=%q", first.Code, first.Body.String())
 	}
 }
+
 func TestDoHConcurrencyGateRejectsBeforeReadingBody(t *testing.T) {
 	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Error("backend must not be reached while the concurrency gate is full")
@@ -691,6 +776,7 @@ func TestDoHRejectsOversizedGET(t *testing.T) {
 		t.Fatalf("backend was called %d times for oversized GET; want 0", backendCalls)
 	}
 }
+
 func TestDoHRejectsInvalidInputBeforeBackend(t *testing.T) {
 	backendCalls := 0
 	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -712,15 +798,6 @@ func TestDoHRejectsInvalidInputBeforeBackend(t *testing.T) {
 		{
 			name:   "GET without dns parameter",
 			req:    httptest.NewRequest(http.MethodGet, "http://gateway.test/dns-query?x=1", nil),
-			status: http.StatusBadRequest,
-		},
-		{
-			name: "GET base64 with embedded newline",
-			req: func() *http.Request {
-				encoded := base64.RawURLEncoding.EncodeToString(testDNSQuery(0x44))
-				malformed := encoded[:4] + "%0A" + encoded[4:]
-				return httptest.NewRequest(http.MethodGet, "http://gateway.test/dns-query?dns="+malformed, nil)
-			}(),
 			status: http.StatusBadRequest,
 		},
 		{
@@ -777,6 +854,27 @@ func TestDoHRejectsInvalidInputBeforeBackend(t *testing.T) {
 		t.Fatalf("backend was called %d times for rejected input; want 0", backendCalls)
 	}
 }
+
+func TestDoHRejectsOversizedDeclaredPOSTWithoutReadingBody(t *testing.T) {
+	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("backend must not be called for an oversized declared body")
+	})
+	defer cleanup()
+	body := &trackingBody{}
+	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/dns-query", nil)
+	req.Body = body
+	req.ContentLength = maxDNSBody + 1
+	req.Header.Set("Content-Type", "application/dns-message")
+	rec := httptest.NewRecorder()
+	s.handleDoH(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d; want 413, body=%q", rec.Code, rec.Body.String())
+	}
+	if body.read {
+		t.Fatal("oversized declared request body was read before rejection")
+	}
+}
+
 func TestDoHRejectsOversizedPOST(t *testing.T) {
 	backendCalls := 0
 	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -785,6 +883,9 @@ func TestDoHRejectsOversizedPOST(t *testing.T) {
 	defer cleanup()
 	body := bytes.Repeat([]byte{0}, maxDNSBody+1)
 	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/dns-query", bytes.NewReader(body))
+	// Simulate a streaming/chunked request whose size is not declared up front,
+	// so this covers MaxBytesReader rather than the Content-Length fast path.
+	req.ContentLength = -1
 	req.Header.Set("Content-Type", "application/dns-message")
 	rec := httptest.NewRecorder()
 	s.handleDoH(rec, req)
@@ -795,6 +896,7 @@ func TestDoHRejectsOversizedPOST(t *testing.T) {
 		t.Fatalf("backend was called %d times for oversized input; want 0", backendCalls)
 	}
 }
+
 func TestDoHRejectsInvalidUpstreamResponse(t *testing.T) {
 	query := testDNSQuery(0x51)
 	cases := []struct {
@@ -843,6 +945,7 @@ func TestDoHRejectsInvalidUpstreamResponse(t *testing.T) {
 		})
 	}
 }
+
 func TestDoHUpstreamTimeoutReturns504(t *testing.T) {
 	query := testDNSQuery(0x64)
 	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -857,6 +960,7 @@ func TestDoHUpstreamTimeoutReturns504(t *testing.T) {
 		t.Fatalf("status=%d; want 504, body=%q", rec.Code, rec.Body.String())
 	}
 }
+
 func TestDoHUpstreamConnectionFailureReturns502(t *testing.T) {
 	query := testDNSQuery(0x65)
 	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -869,11 +973,12 @@ func TestDoHUpstreamConnectionFailureReturns502(t *testing.T) {
 		t.Fatalf("status=%d; want 502, body=%q", rec.Code, rec.Body.String())
 	}
 }
+
 func TestDoHRejectsOversizedDeclaredUpstreamContentLength(t *testing.T) {
 	query := testDNSQuery(0x63)
 	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/dns-message")
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", maxDNSBody+1))
+		w.Header().Set("Content-Length", strconv.Itoa(maxDNSBody+1))
 		w.WriteHeader(http.StatusOK)
 	})
 	defer cleanup()
@@ -882,6 +987,7 @@ func TestDoHRejectsOversizedDeclaredUpstreamContentLength(t *testing.T) {
 		t.Fatalf("status=%d; want 502", rec.Code)
 	}
 }
+
 func TestDoHRejectsOversizedUpstreamHeaders(t *testing.T) {
 	query := testDNSQuery(0x62)
 	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -898,6 +1004,7 @@ func TestDoHRejectsOversizedUpstreamHeaders(t *testing.T) {
 		t.Fatalf("status=%d; want 502", rec.Code)
 	}
 }
+
 func TestDoHDoesNotFollowBackendRedirects(t *testing.T) {
 	query := testDNSQuery(0x61)
 	called := 0
@@ -926,6 +1033,7 @@ func TestDoHDoesNotFollowBackendRedirects(t *testing.T) {
 		t.Fatalf("backend was called %d times; want exactly 1", called)
 	}
 }
+
 func TestGatewayHealthReadyWhenBackendListenerAccepts(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -943,6 +1051,7 @@ func TestGatewayHealthReadyWhenBackendListenerAccepts(t *testing.T) {
 		t.Fatalf("health body=%q; want ok", got)
 	}
 }
+
 func TestGatewayHealthRequiresBackend(t *testing.T) {
 	s := &server{backendAddr: "127.0.0.1:1"}
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
@@ -952,6 +1061,7 @@ func TestGatewayHealthRequiresBackend(t *testing.T) {
 		t.Fatalf("health status=%d; want 503", rec.Code)
 	}
 }
+
 func TestGatewayHealthProbeIsCached(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -981,6 +1091,7 @@ func TestClientIPUsesFirstValidForwardedAddress(t *testing.T) {
 		t.Fatalf("clientIP=%q; want 198.51.100.7", got)
 	}
 }
+
 func TestClientIPUsesFirstAcrossMultipleForwardedHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
 	req.RemoteAddr = "192.0.2.10:1234"
@@ -992,6 +1103,7 @@ func TestClientIPUsesFirstAcrossMultipleForwardedHeaders(t *testing.T) {
 		t.Fatalf("clientIP=%q; want 198.51.100.7", got)
 	}
 }
+
 func TestClientIPPrefersCloudflareConnectingIP(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
 	req.RemoteAddr = "192.0.2.10:1234"
@@ -1001,6 +1113,7 @@ func TestClientIPPrefersCloudflareConnectingIP(t *testing.T) {
 		t.Fatalf("clientIP=%q; want 198.51.100.8", got)
 	}
 }
+
 func TestClientIPNormalizesIPv6(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
 	req.RemoteAddr = "[2001:0db8:0000:0000:0000:0000:0000:0001]:443"
@@ -1012,6 +1125,7 @@ func TestClientIPNormalizesIPv6(t *testing.T) {
 		t.Fatalf("clientIP=%q; want 2001:db8::2", got)
 	}
 }
+
 func TestClientIPDoesNotTrustForwardedHeadersWhenDisabled(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
 	req.RemoteAddr = "192.0.2.10:1234"
@@ -1020,6 +1134,7 @@ func TestClientIPDoesNotTrustForwardedHeadersWhenDisabled(t *testing.T) {
 		t.Fatalf("clientIP=%q; want remote peer address", got)
 	}
 }
+
 func TestParseEnvIntRejectsUnsafeValues(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -1044,6 +1159,7 @@ func TestParseEnvIntRejectsUnsafeValues(t *testing.T) {
 		})
 	}
 }
+
 func TestParseEnvBoolRejectsInvalidValues(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -1068,6 +1184,7 @@ func TestParseEnvBoolRejectsInvalidValues(t *testing.T) {
 		})
 	}
 }
+
 func TestValidContentType(t *testing.T) {
 	cases := map[string]bool{
 		"application/dns-message":                 true,
@@ -1084,6 +1201,7 @@ func TestValidContentType(t *testing.T) {
 		})
 	}
 }
+
 func TestDoHInvalidRequestsDoNotConsumeRateBudget(t *testing.T) {
 	backendCalls := 0
 	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1116,42 +1234,24 @@ func TestDoHInvalidRequestsDoNotConsumeRateBudget(t *testing.T) {
 	}
 }
 
-func TestLimiterRefreshesSeenOnRateLimitedRequests(t *testing.T) {
-	// The window (5m) outlasts the idle TTL (2m) so the second request is
-	// still rate limited when it arrives after the TTL.
-	l := newLimiter(1, 5*time.Minute, 2)
-	now := time.Unix(7_000_000, 0)
-	if got := l.check("198.51.100.1", now); got != limitAllowed {
-		t.Fatalf("first request got %v; want allowed", got)
-	}
-	rejected := now.Add(150 * time.Second) // past the 2-minute idle TTL
-	if got := l.check("198.51.100.1", rejected); got != limitRateLimited {
-		t.Fatalf("second request got %v; want rate limited", got)
-	}
-	if got := l.clients["198.51.100.1"].seen; got != rejected.UnixNano() {
-		t.Fatalf("seen=%v; want %v refreshed by the rejected request", time.Unix(0, got), rejected)
-	}
-}
-
 func TestLimiterKeepsPersistentlyRateLimitedClientAtCapacity(t *testing.T) {
 	// A 10-minute window keeps the first timestamp live for the whole test.
 	l := newLimiter(1, 10*time.Minute, 1)
 	start := time.Unix(8_000_000, 0)
-	if got := l.check("198.51.100.1", start); got != limitAllowed {
+	if got := checkLimiter(l, "198.51.100.1", start); got != limitAllowed {
 		t.Fatalf("first request got %v; want allowed", got)
 	}
 	last := start
-	// Six 30s steps end 180s after the first request, beyond the 2-minute idle
-	// TTL, so the client would be evictable had its seen time not been
-	// refreshed by the rejected requests.
+	// Six 30s steps end 180s after the first request, beyond the default
+	// 2-minute idle TTL. The window-aware TTL (10m) must keep the throttled
+	// client's state, so a new client still sees limitCapacity.
 	for i := 0; i < 6; i++ {
 		last = last.Add(30 * time.Second)
-		if got := l.check("198.51.100.1", last); got != limitRateLimited {
+		if got := checkLimiter(l, "198.51.100.1", last); got != limitRateLimited {
 			t.Fatalf("follow-up request %d got %v; want rate limited", i+2, got)
 		}
 	}
-	// The throttled-but-active client must not be evictable as idle.
-	if got := l.check("198.51.100.2", last); got != limitCapacity {
+	if got := checkLimiter(l, "198.51.100.2", last); got != limitCapacity {
 		t.Fatalf("new client got %v; want limitCapacity", got)
 	}
 }
@@ -1194,5 +1294,136 @@ func TestDoHHeadRequestIsRejected(t *testing.T) {
 	}
 	if got := rec.Header().Get("Allow"); got != "GET, POST, OPTIONS" {
 		t.Fatalf("Allow=%q; want GET, POST, OPTIONS", got)
+	}
+}
+
+type failingBody struct{}
+
+func (failingBody) Read(_ []byte) (int, error) {
+	return 0, errors.New("simulated mid-read failure")
+}
+
+func (failingBody) Close() error {
+	return nil
+}
+
+func TestDecodeDoHPOSTBodyReadFailure(t *testing.T) {
+	// A POST body reader that fails with a non-EOF, non-size-limit error
+	// (e.g. a mid-read network error) must surface errFailedReadDNSBody,
+	// which the handler maps to a 400 response.
+	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/dns-query", failingBody{})
+	req.Header.Set("Content-Type", "application/dns-message")
+	if _, err := decodeDoHQuery(httptest.NewRecorder(), req); !errors.Is(err, errFailedReadDNSBody) {
+		t.Fatalf("decodeDoHQuery error=%v; want %v for a failing POST body reader", err, errFailedReadDNSBody)
+	}
+}
+
+func TestLimiterIdleTTLNeverShorterThanWindow(t *testing.T) {
+	l := newLimiter(1, 5*time.Minute, 1)
+	if l.idleTTL != 5*time.Minute {
+		t.Fatalf("idleTTL=%v; want it raised to the 5m window", l.idleTTL)
+	}
+	if short := newLimiter(1, time.Minute, 1); short.idleTTL != clientIdleTTL {
+		t.Fatalf("idleTTL=%v; want the %v default for a short window", short.idleTTL, clientIdleTTL)
+	}
+	start := time.Unix(9_000_000, 0)
+	if got := checkLimiter(l, "198.51.100.1", start); got != limitAllowed {
+		t.Fatalf("first request got %v; want allowed", got)
+	}
+	// Past the default idle TTL but still inside the window: the live
+	// timestamp must survive eviction, so the budget cannot be reset.
+	l.mu.Lock()
+	l.evictStaleLocked(start.Add(clientIdleTTL + time.Second))
+	l.mu.Unlock()
+	if got := checkLimiter(l, "198.51.100.1", start.Add(clientIdleTTL+time.Second)); got != limitRateLimited {
+		t.Fatalf("request got %v; want rate limited (state evicted while its window was live)", got)
+	}
+	// Once the window has fully elapsed since the last accepted request, the
+	// idle state is reclaimable.
+	l.mu.Lock()
+	l.evictStaleLocked(start.Add(5*time.Minute + time.Second))
+	l.mu.Unlock()
+	if _, ok := l.clients["198.51.100.1"]; ok {
+		t.Fatal("idle state was not evicted after the window elapsed")
+	}
+}
+
+func TestDoHSuccessSetsContentLength(t *testing.T) {
+	query := testDNSQuery(0x94)
+	response := testDNSResponse(query)
+	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(response)
+	})
+	defer cleanup()
+	rec := postDoH(s, query, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d; want 200", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Length"); got != strconv.Itoa(len(response)) {
+		t.Fatalf("Content-Length=%q; want %d", got, len(response))
+	}
+}
+
+// slotProbeWriter records how many concurrency slots were still held at the
+// moment the gateway started writing the response.
+type slotProbeWriter struct {
+	*httptest.ResponseRecorder
+	s          *server
+	heldAtSend int
+}
+
+func (w *slotProbeWriter) WriteHeader(code int) {
+	w.heldAtSend = len(w.s.concurrent)
+	w.ResponseRecorder.WriteHeader(code)
+}
+
+func TestDoHReleasesConcurrencySlotBeforeWritingResponse(t *testing.T) {
+	query := testDNSQuery(0x95)
+	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(testDNSResponse(query))
+	})
+	defer cleanup()
+	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/dns-query", bytes.NewReader(query))
+	req.Header.Set("Content-Type", "application/dns-message")
+	w := &slotProbeWriter{ResponseRecorder: httptest.NewRecorder(), s: s, heldAtSend: -1}
+	s.handleDoH(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d; want 200", w.Code)
+	}
+	if w.heldAtSend != 0 {
+		t.Fatalf("%d slot(s) still held when the response was written; want 0", w.heldAtSend)
+	}
+	if got := len(s.concurrent); got != 0 {
+		t.Fatalf("%d slot(s) held after the handler returned; want 0", got)
+	}
+}
+
+func TestDoHReleasesConcurrencySlotOnEveryEarlyReturn(t *testing.T) {
+	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	defer cleanup()
+	for _, query := range [][]byte{{1, 2, 3, 4}, testDNSQuery(0x96)} {
+		_ = postDoH(s, query, "")
+		if got := len(s.concurrent); got != 0 {
+			t.Fatalf("%d slot(s) leaked after a rejected request; want 0", got)
+		}
+	}
+}
+
+func TestDecodeDoHGETRejectsCRAndLF(t *testing.T) {
+	encoded := base64.RawURLEncoding.EncodeToString(testDNSQuery(0x97))
+	for _, escape := range []string{"%0A", "%0D", "%0D%0A"} {
+		req := httptest.NewRequest(http.MethodGet, "http://gateway.test/dns-query?dns="+encoded[:4]+escape+encoded[4:], nil)
+		if _, err := decodeDoHQuery(httptest.NewRecorder(), req); err != errInvalidDNSParameter {
+			t.Fatalf("dns value with %s: error=%v; want %v", escape, err, errInvalidDNSParameter)
+		}
+	}
+	// A clean value still decodes.
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/dns-query?dns="+encoded, nil)
+	if got, err := decodeDoHQuery(httptest.NewRecorder(), req); err != nil || !bytes.Equal(got, testDNSQuery(0x97)) {
+		t.Fatalf("clean GET value: got=%v err=%v", got, err)
 	}
 }

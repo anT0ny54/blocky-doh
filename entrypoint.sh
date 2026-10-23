@@ -1,16 +1,12 @@
 #!/bin/sh
+# The supervision and shutdown functions below are only ever invoked through
+# trap handlers, which ShellCheck cannot see.
+# shellcheck disable=SC2317
 set -eu
 
 BLOCKY_PID=0
 GATEWAY_PID=0
 SHUTDOWN_DONE=0
-
-# Use an atomically-created private status directory. PID-only names can
-# collide when instances share a temporary volume but use separate PID namespaces.
-STATUS_ROOT="${TMPDIR:-/tmp}"
-STATUS_DIR=$(umask 077; mktemp -d "$STATUS_ROOT/doh-gateway-status.XXXXXX")
-BLOCKY_STATUS="$STATUS_DIR/blocky"
-GATEWAY_STATUS="$STATUS_DIR/gateway"
 
 # Unprivileged-port guard. The image runs as the unprivileged "app" user
 # without CAP_NET_BIND_SERVICE, so any listener below 1024 dies at bind
@@ -37,7 +33,9 @@ require_unprivileged() {
 
 BLOCKY_CONFIG=/etc/blocky/config.yml
 # Listener values under the "ports:" block of the pinned Blocky config.
-# shellcheck disable=SC2046
+# Values contain no whitespace after the awk cleanup, so word splitting is the
+# intended way to iterate them.
+# shellcheck disable=SC2013
 for value in $(awk '
   /^ports:/ { inports=1; next }
   inports && /^[^[:space:]]/ { inports=0 }
@@ -52,6 +50,13 @@ done
 if [ -n "${PORT:-}" ]; then
   require_unprivileged "PORT environment variable" "$PORT"
 fi
+
+# Create supervision state only after configuration guards pass, so a refused
+# privileged-port configuration does not leave a stale directory in /tmp.
+STATUS_ROOT="${TMPDIR:-/tmp}"
+STATUS_DIR=$(umask 077; mktemp -d "$STATUS_ROOT/doh-gateway-status.XXXXXX")
+BLOCKY_STATUS="$STATUS_DIR/blocky"
+GATEWAY_STATUS="$STATUS_DIR/gateway"
 
 run_supervised() {
   status_file=$1

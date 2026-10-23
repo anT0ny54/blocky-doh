@@ -69,7 +69,6 @@ COPY --from=builder /out/entrypoint.sh /entrypoint.sh
 EXPOSE 8080
 
 ENV GOMAXPROCS=1 \
-    GOGC=100 \
     GOMEMLIMIT=160MiB \
     RATE_LIMIT=99 \
     MAX_CLIENTS=8192 \
