@@ -18,7 +18,8 @@ Internet / SnapDeploy HTTPS
           v
   doh-gateway :$PORT
      |       |
-     |       +-- per-client-IP limiter: 99 / 60s strict sliding window
+     |       +-- per-client-IP limiter (IPv4 exact, IPv6 grouped by prefix): 99 / 60s strict sliding window
+     |       +-- per-client-IP health budget on /healthz (HEALTH_RATE, default 60 / 60s)
      |       +-- max concurrent DNS requests: 8 (default and hard cap; configurable only downward)
      |       +-- DNS wire-format validation
      |
@@ -31,9 +32,9 @@ Internet / SnapDeploy HTTPS
 
 The exact **99 requests / 60 seconds / client IP** policy is deliberately kept in the gateway rather than delegated to Blocky, so the policy remains independent of Blocky release changes.
 
-The limiter is a **strict sliding window**: at most 99 requests per client IP fall inside any rolling 60-second span. There is no token refill — after a full 99-request burst, further requests are admitted only as earlier timestamps age out of the window. Two rejection modes are distinguished: an over-budget client receives `429` with a `Retry-After` header holding the whole seconds until its oldest request leaves the window (at most 60), while a new client arriving when the fixed client table is full receives `503`, so capacity exhaustion is not mistaken for per-client throttling.
+The limiter is a **strict sliding window**: at most 99 requests per client identity fall inside any rolling 60-second span. Client identity is the exact IPv4 address, or the IPv6 address masked to `IPV6_PREFIX` (default `/64`, see Configuration) so address rotation inside one routed prefix cannot mint additional windows. There is no token refill — after a full 99-request burst, further requests are admitted only as earlier timestamps age out of the window. Two rejection modes are distinguished: an over-budget client receives `429` with a `Retry-After` header holding the whole seconds until its oldest request leaves the window (at most 60), while a new client arriving when the fixed client table is full receives `503`, so capacity exhaustion is not mistaken for per-client throttling.
 
-Client states whose newest accepted request is more than 2 minutes old — or older than the window, if the window is longer than that — are evicted by a 60-second background sweep and, when the table is full, by an on-demand scan that runs at most once per second. Because the idle threshold is never shorter than the window, a state is never evicted while it still holds live timestamps, so eviction cannot reset a client's budget; live states are also never evicted to admit a new client. Liveness is derived from the newest stored timestamp, so a throttled client keeps its state for exactly as long as its budget is in use and no separate liveness field is tracked. The rate budget is charged only after a request passes body validation and the concurrency gate, so malformed or over-capacity requests never consume a client's window. Client identities are normalized with `net.IP.String()`, so an IPv6 client cannot occupy multiple limiter states via alternate textual encodings of the same address.
+Client states whose newest accepted request is more than 2 minutes old — or older than the window, if the window is longer than that — are evicted by a 60-second background sweep and, when the table is full, by an on-demand scan that runs at most once per second. Because the idle threshold is never shorter than the window, a state is never evicted while it still holds live timestamps, so eviction cannot reset a client's budget; live states are also never evicted to admit a new client. Liveness is derived from the newest stored timestamp, so a throttled client keeps its state for exactly as long as its budget is in use and no separate liveness field is tracked. The rate budget is charged only after a request passes body validation and the concurrency gate, so malformed or over-capacity requests never consume a client's window. Client identities are normalized with `net.IP.String()` after parsing, so alternate textual encodings of the same address cannot occupy multiple limiter states; the prefix mask is applied on top of that normalization. The mask is computed with `net/netip` (no per-request allocations); the derived identity-key strings are unchanged. Proxy identity headers are honored only from `TRUSTED_PROXIES` peers (see below), so `TRUST_PROXY=true` on a directly reachable port cannot be used to forge identities.
 
 The limiter samples each request timestamp after acquiring the client-state lock, so concurrent requests for one IP are ordered with their window updates. The `Retry-After` delay is calculated from that same timestamp and the oldest in-window timestamp snapshot before the lock is released; later requests cannot change a rejection's delay, and the value is capped at the configured window as a defensive bound. Timestamps remain ordered, so expired entries are skipped with a binary search and the oldest request is available in O(1).
 
@@ -58,7 +59,7 @@ Example endpoint after a custom domain is attached:
 
 `https://dns.example.com/dns-query`
 
-The `/healthz` endpoint (`GET`/`HEAD`) returns `200` only when a TCP connection to Blocky's loopback listener (`127.0.0.1:8053`) succeeds within 250 ms, otherwise `503`. This lets the container health check catch a failed DNS backend rather than reporting the gateway as ready by itself. It is a connect check only, not a DNS query. Methods other than `GET`/`HEAD` receive `405`. Other paths are intentionally rejected with `404`; the one exception is a non-canonical path such as `//dns-query` or `/a/../dns-query`, which Go's `http.ServeMux` answers with a `301` redirect to the cleaned path before routing.
+The `/healthz` endpoint (`GET`/`HEAD`) returns `200` only when a TCP connection to Blocky's loopback listener (`127.0.0.1:8053`) succeeds within 250 ms, otherwise `503`. This lets the container health check catch a failed DNS backend rather than reporting the gateway as ready by itself. It is a connect check only, not a DNS query. `/healthz` is public, so it carries its own coarse per-client-IP budget (`HEALTH_RATE`, default 60 requests per 60-second window, independent of `RATE_LIMIT`); an over-budget client receives `429` with `Retry-After`. Methods other than `GET`/`HEAD` receive `405`. Other paths are intentionally rejected with `404`; the one exception is a non-canonical path such as `//dns-query` or `/a/../dns-query`, which Go's `http.ServeMux` answers with a `301` redirect to the cleaned path before routing.
 
 ## DoH handling and validation
 
@@ -76,7 +77,7 @@ This validation is primarily a resource-safety and protocol-correctness guard; i
 
 ### Request order and status codes
 
-`/dns-query` requests are checked in this order, and the first failing check decides the response: HTTP method, then the concurrency gate, then body/query decoding and size, then DNS wire-format validation, then the per-client rate limiter, and finally the backend call. The concurrency gate is intentionally before parsing so malformed or oversized request floods cannot consume unbounded CPU or memory outside the configured in-flight budget. The gate slot is released as soon as the upstream answer has been verified, before the response is written to the client, so a slow-reading client cannot hold one of the few slots while its reply drains. The rate budget is charged only after DNS validation, so malformed requests do not consume a client window.
+`/dns-query` requests are checked in this order, and the first failing check decides the response: HTTP method, then the concurrency gate, then body/query decoding and size, then DNS wire-format validation, then client-identity resolution (a non-loopback trusted proxy without a valid identity is rejected with `503` in strict mode), then the per-client rate limiter, and finally the backend call. The concurrency gate is intentionally before parsing so malformed or oversized request floods cannot consume unbounded CPU or memory outside the configured in-flight budget. The gate slot is released as soon as the upstream answer has been verified, before the response is written to the client, so a slow-reading client cannot hold one of the few slots while its reply drains. The rate budget is charged only after DNS validation, so malformed requests do not consume a client window.
 
 | Status | When |
 |---|---|
@@ -86,24 +87,24 @@ This validation is primarily a resource-safety and protocol-correctness guard; i
 | `405` | Method not allowed (`Allow` header is set). |
 | `413` | GET raw query string over the 10,927-character bound, or POST body over 8,192 bytes. |
 | `415` | POST whose `Content-Type` is not `application/dns-message` (parameters such as `charset` are accepted). |
-| `429` | Client exceeded its sliding window; `Retry-After` is 1–60 seconds. |
+| `429` | Client exceeded its sliding window (or its `/healthz` budget); `Retry-After` is 1–60 seconds. |
 | `500` | The gateway could not build the backend request. |
 | `502` | Backend unreachable, or its response failed any verification check (status, content type, size, wire format, transaction ID, opcode/RD echo, or question echo). |
-| `503` | Concurrency limit reached, or the client table is full and the client is new. Also `/healthz` when Blocky's listener does not accept a connection. |
+| `503` | Concurrency limit reached, the client table is full and the client is new, or a non-loopback trusted proxy presented no valid client identity (strict mode). Also `/healthz` when Blocky's listener does not accept a connection. |
 | `504` | Backend request exceeded its 3-second deadline or 2.5-second response-header timeout. |
 
 All gateway-generated error responses are plain text with `Cache-Control: no-store`; they carry no CORS headers.
 
-### Known limitations
-
-- Rate limiting is per exact client IP. IPv6 addresses are intentionally not grouped by prefix in this gateway, so a subscriber that can rotate source addresses inside a routed `/64` can obtain additional windows. The bounded client table is designed to cap memory rather than provide a perfect identity system.
-- `/healthz` is public and is not covered by the rate limiter or the DoH concurrency gate. Its loopback readiness probe is cached for 2 seconds, so repeated health checks do not create a TCP connection storm.
-- With `TRUST_PROXY=true`, the client identity comes from request headers. If the edge does not overwrite or strip a client-supplied `CF-Connecting-IP`, `X-Forwarded-For` or `X-Real-IP`, a client can choose its own limiter identity: it can bypass the per-IP budget and fill the client table so that new clients receive `503`. Verify the platform's header handling before relying on the limit, and use `TRUST_PROXY=false` on any directly reachable port.
-- With `TRUST_PROXY=true`, a request that carries no valid `CF-Connecting-IP`, `X-Forwarded-For`, or `X-Real-IP` value is attributed to its TCP peer, which behind a load balancer is the load balancer itself.
-
 ## Important client-IP setting
 
-`TRUST_PROXY=true` is enabled in the production image for the intended SnapDeploy edge deployment. The gateway first uses `CF-Connecting-IP`, then the first valid address in `X-Forwarded-For`, then `X-Real-IP`, and otherwise falls back to the TCP peer address. The trusted edge must overwrite/sanitize these headers before forwarding; do not enable proxy-header trust on a directly reachable port. This keeps one stable client-IP key when the platform supplies the original address.
+`TRUST_PROXY=true` is enabled in the production image for the intended SnapDeploy edge deployment. The gateway consults proxy identity headers **only when the TCP peer itself belongs to a `TRUSTED_PROXIES` network**; headers from any other peer are ignored and the TCP peer address is used, so `TRUST_PROXY` cannot be abused on a directly reachable port. When `TRUST_PROXY=true` and `TRUSTED_PROXIES` is unset, the gateway trusts loopback, link-local, IPv6 ULA and the RFC 1918 private ranges — the networks a platform load balancer typically connects from. Set `TRUSTED_PROXIES` to an explicit comma-separated list of IPs/CIDRs to restrict trust further (bare IPs match exactly; invalid entries are ignored). When `TRUST_PROXY=false`, no headers are ever trusted.
+
+On top of peer trust, two mechanisms close the remaining identity gaps:
+
+- **Signed identity (spoofing-proof):** set `TRUST_SECRET` to a shared secret and have the edge send the client IP in the `TRUST_HEADER` header (default `X-Real-Client-IP`) together with a lowercase hex HMAC-SHA256 of the exact header value in `<TRUST_HEADER>-Sig` (default `X-Real-Client-IP-Sig`). The gateway accepts the identity only when the signature verifies, so a client cannot forge an identity even if a header value reaches the gateway un-sanitized. Without `TRUST_SECRET`, the gateway falls back to the conventional headers (`CF-Connecting-IP`, first valid `X-Forwarded-For`, `X-Real-IP`), which the edge must still sanitize.
+- **Strict identity (no silent proxy bucket):** with `TRUST_REQUIRE_IDENTITY=true` (the default), a non-loopback trusted peer that presents no valid identity receives `503` instead of being attributed to the proxy itself. Loopback peers are exempt, so the container health check works without identity headers. Set it to `false` only if your platform sometimes forwards requests without any client-identity header.
+
+Rate identity is prefix-based: an actor controlling multiple routed IPv6 prefixes could still obtain multiple windows. That is a threat-model boundary for an anonymous public resolver — the per-prefix sliding window plus the bounded client table are the enforcement mechanism, and a stricter prefix can be selected with `IPV6_PREFIX`.
 
 For a direct local/container test without a trusted proxy, set `TRUST_PROXY=false`. Invalid `TRUST_PROXY` values fall back to the safe default (`false`). The Dockerfile's production `ENV` defaults to `true` because SnapDeploy's load balancer is the trusted proxy in that path.
 
@@ -113,17 +114,23 @@ On `SIGINT`/`SIGTERM`, the gateway stops accepting new connections and drains in
 
 ## Configuration
 
-For `RATE_LIMIT`, `MAX_CLIENTS`, and `MAX_CONCURRENT`, unset, empty, non-numeric, below-1, or above-cap values fall back to the listed default. `TRUST_PROXY` also falls back to its safe default (`false` in the binary) when unset, empty, or invalid. `PORT` is different: an empty value selects `8080`, a privileged port is refused by `entrypoint.sh`, and other unusable values cause the gateway to fail at startup.
+For `RATE_LIMIT`, `MAX_CLIENTS`, `HEALTH_RATE`, and `MAX_CONCURRENT`, unset, empty, non-numeric, below-1, or above-cap values fall back to the listed default. `IPV6_PREFIX` accepts `0`–`128` (out-of-range values fall back to the default; `0` disables grouping). `TRUST_PROXY` also falls back to its safe default (`false` in the binary) when unset, empty, or invalid. `TRUSTED_PROXIES` entries that are neither an IP nor a CIDR are ignored. `TRUST_SECRET` accepts any non-empty value (use a long random string); an empty value disables signed-identity mode. `PORT` is different: an empty value selects `8080`, a privileged port is refused by `entrypoint.sh`, and other unusable values cause the gateway to fail at startup.
 
 | Variable | Default | Allowed range | Meaning |
 |---|---|---|---|
 | `PORT` | `8080` | TCP port number | Public listener port (a leading `:` is accepted). The gateway itself does not range-check it; `entrypoint.sh` refuses to start if it names a privileged port (<1024), and any other unusable value makes the gateway exit at startup. |
-| `RATE_LIMIT` | `99` | 1–256 | Requests per client IP per 60-second sliding window. The window length is fixed. |
+| `RATE_LIMIT` | `99` | 1–256 | Requests per client identity per 60-second sliding window. The window length is fixed. Identity is the exact IPv4 address, or the IPv6 address masked to `IPV6_PREFIX`. |
+| `IPV6_PREFIX` | `64` | 0–128 | Prefix length used to group IPv6 clients into one rate-limit identity. `0` restores exact per-address identity (the pre-grouping behavior). IPv4 clients are always individual. |
 | `MAX_CLIENTS` | `8192` | 1–32768 | Maximum client rate-limit states held in memory. |
 | `MAX_CONCURRENT` | `8` | 1–8 | Maximum in-flight DNS requests, covering body parsing and backend work (the slot is released before the response is written to the client). The default and hard cap are both 8, so the variable can only lower the limit. |
-| `TRUST_PROXY` | `false` in the binary, `true` in the Docker image | `true`/`false` (case-insensitive) | Use `CF-Connecting-IP`, then `X-Forwarded-For`/`X-Real-IP` for client identity. |
+| `HEALTH_RATE` | `60` | 1–256 | Per-client-IP request budget for `/healthz` per 60-second window, independent of `RATE_LIMIT`. Excess health requests receive `429`. |
+| `TRUST_PROXY` | `false` in the binary, `true` in the Docker image | `true`/`false` (case-insensitive) | Use `CF-Connecting-IP`, then `X-Forwarded-For`/`X-Real-IP` for client identity, but only when the TCP peer belongs to `TRUSTED_PROXIES`; otherwise the TCP peer address is used. |
+| `TRUSTED_PROXIES` | loopback, link-local, ULA and RFC 1918 ranges when `TRUST_PROXY=true`; none when `TRUST_PROXY=false` | comma-separated IPs/CIDRs | Networks whose proxy identity headers are honored when `TRUST_PROXY=true`. Bare IPs match exactly; invalid entries are ignored. |
+| `TRUST_SECRET` | unset (disabled) | any non-empty string | Shared secret enabling HMAC-SHA256 verification of the `TRUST_HEADER` client-identity header; without a valid signature the header is ignored. |
+| `TRUST_HEADER` | `X-Real-Client-IP` | header name | Header carrying the claimed client IP from the trusted edge; the signature arrives in `<name>-Sig`. Used only when `TRUST_SECRET` is set. |
+| `TRUST_REQUIRE_IDENTITY` | `true` | `true`/`false` (case-insensitive) | Reject (`503`) requests from a non-loopback trusted proxy that carry no valid client identity, instead of attributing them to the proxy itself. Loopback peers are always exempt. |
 
-The Dockerfile's `ENV` sets `GOMAXPROCS=1`, `GOMEMLIMIT=160MiB`, `RATE_LIMIT=99`, `MAX_CLIENTS=8192`, `MAX_CONCURRENT=8` and `TRUST_PROXY=true`. `GOGC` is left at the Go default of `100`.
+The Dockerfile's `ENV` sets `GOMAXPROCS=1`, `GOMEMLIMIT=160MiB`, `RATE_LIMIT=99`, `MAX_CLIENTS=8192`, `MAX_CONCURRENT=8` and `TRUST_PROXY=true`. `IPV6_PREFIX`, `HEALTH_RATE`, `TRUSTED_PROXIES`, `TRUST_SECRET`, `TRUST_HEADER` and `TRUST_REQUIRE_IDENTITY` keep their binary defaults unless set explicitly. `GOGC` is left at the Go default of `100`.
 
 The Blocky backend address (`127.0.0.1:8053`) is fixed in the gateway and must match `ports.http` in `config.yml`. The Blocky config path (`/etc/blocky/config.yml`) is fixed in `entrypoint.sh`.
 
@@ -133,7 +140,10 @@ The default values are chosen for the Small tier:
 
 - `GOMAXPROCS=1` — matches the Go runtime's scheduler/GC thread count to the tier's 0.25 vCPU quota instead of the host's full core count. The Dockerfile sets it for the whole container, so it applies to the Blocky process as well as the gateway.
 - `MAX_CONCURRENT=8` — bounds both request parsing and backend DNS work, which is a better fit for 0.25 vCPU. Requests beyond the limit receive `503` immediately.
-- `MAX_CLIENTS=8192` — hard cap on in-memory rate-limit client states; the limiter map is allocated only when the first request arrives. When the table is full, new clients receive `503` and the event is logged, while over-budget clients receive `429`. Idle states are reclaimed after 2 minutes, so this gives headroom for thousands of active client IPs without allowing unbounded map growth.
+- `MAX_CLIENTS=8192` — hard cap on in-memory rate-limit client states; the limiter map is allocated only when the first request arrives. When the table is full, new clients receive `503` and the event is logged, while over-budget clients receive `429`. Idle states are reclaimed after 2 minutes, so this gives headroom for thousands of active client identities (IPv4 addresses plus IPv6 prefixes) without allowing unbounded map growth.
+- `IPV6_PREFIX=64` — one of the most common routed subscriber prefix sizes; grouping at `/64` stops in-prefix address rotation from multiplying rate windows. Raise it toward `128` (or set `0`) only if your clients legitimately span a single large prefix with many distinct users.
+- `HEALTH_RATE=60` — the public `/healthz` endpoint gets its own budget (60 per 60 s), so it cannot be used as an unthrottled request driver; the container health check polls every 30 s and stays well under the budget.
+- `TRUST_REQUIRE_IDENTITY=true` — a trusted edge that loses its client-identity headers fails closed (`503`) instead of silently giving every client one shared proxy bucket; loopback is exempt so the in-container health check is unaffected. Pair it with `TRUST_SECRET` at the edge to make identities unforgeable.
 - `caching.maxItemsCount=16384` — bounded Blocky cache; this halves cache metadata versus 32,768 entries and leaves more headroom for the gateway, TLS, and Go runtime under a 512 MB container. `caching.cacheTimeNegative=5m` caches negative answers for five minutes.
 - `upstreams.strategy=random` — one upstream request per cache miss in the normal path; this avoids the extra upstream fan-out of `parallel_best` and is a better fit for 0.25 vCPU.
 - `upstreams.timeout=1200ms` — keeps each failed upstream attempt below the gateway's 3-second request deadline and leaves room for fallback.
@@ -164,7 +174,7 @@ docker build -t blocky-doh .
 docker run --rm -p 8080:8080 -e TRUST_PROXY=false blocky-doh
 ```
 
-To run the unit tests without Docker, use `go vet ./... && go test ./...` (Go 1.27 or newer; add `-race` where cgo is available). The suite covers decode and validation rejection paths (including CR/LF smuggled into the `dns=` value), both declared and streaming oversized POST bodies, mid-read POST failures (`failed to read dns message`, surfaced as `400`), out-of-order limiter timestamps, bounded `Retry-After` responses, idle-state eviction relative to the window, concurrency-slot release, and the explicit response `Content-Length`. `entrypoint.sh` is kept clean under `shellcheck -s sh entrypoint.sh`.
+To run the unit tests without Docker, use `go vet ./... && go test ./...` (Go 1.27 or newer; add `-race` where cgo is available). The suite covers decode and validation rejection paths (including CR/LF smuggled into the `dns=` value), rejection of oversized GET query strings before parsing, both declared and streaming oversized POST bodies, mid-read POST failures (`failed to read dns message`, surfaced as `400`), method rejection with the `Allow` header, out-of-order limiter timestamps, bounded `Retry-After` responses, idle-state eviction relative to the window, eviction-scan throttling, lazy limiter-map allocation, concurrency-slot release before the response is written, the explicit response `Content-Length`, health-probe caching, and forwarded-identity header extraction (`CF-Connecting-IP`, first valid `X-Forwarded-For` entry, `X-Real-IP`). `entrypoint.sh` is kept clean under `shellcheck -s sh entrypoint.sh`.
 
 `docker-compose.yml` (service `hagezi-doh`, port `8080:8080`, `restart: unless-stopped`) pins `TRUST_PROXY=false` for the same reason: a plain local compose setup has no trusted load balancer in front, so forwarded headers must be ignored.
 
@@ -192,7 +202,7 @@ This project is a DNS resolver/DoH service, not a general-purpose HTTP/SOCKS pro
 
 | File | Purpose |
 |---|---|
-| `main.go` | DoH gateway: limiter, validation, proxying, health check. |
+| `main.go` | DoH gateway: limiter (IPv6 prefix grouping), trusted-proxy gating, validation, proxying, rate-limited health check. |
 | `main_test.go` | Unit tests, run during `docker build`. |
 | `go.mod` | Go module definition (`go 1.27`, no external dependencies). |
 | `Dockerfile` | Single-builder-stage build and Alpine runtime image. |

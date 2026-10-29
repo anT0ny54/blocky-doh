@@ -1083,54 +1083,54 @@ func TestGatewayHealthProbeIsCached(t *testing.T) {
 	}
 }
 
-func TestClientIPUsesFirstValidForwardedAddress(t *testing.T) {
+func TestForwardedIdentityUsesFirstValidForwardedAddress(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
 	req.RemoteAddr = "192.0.2.10:1234"
 	req.Header.Set("X-Forwarded-For", "198.51.100.7, unknown, 203.0.113.9")
-	if got := clientIP(req, true); got != "198.51.100.7" {
-		t.Fatalf("clientIP=%q; want 198.51.100.7", got)
+	if got := forwardedIdentity(req); got != "198.51.100.7" {
+		t.Fatalf("forwardedIdentity=%q; want 198.51.100.7", got)
 	}
 }
 
-func TestClientIPUsesFirstAcrossMultipleForwardedHeaders(t *testing.T) {
+func TestForwardedIdentityUsesFirstAcrossMultipleForwardedHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
 	req.RemoteAddr = "192.0.2.10:1234"
 	// The trusted proxy is expected to sanitize/overwrite X-Forwarded-For.
 	// The first forwarded address is treated as the client identity.
 	req.Header.Add("X-Forwarded-For", "198.51.100.7")
 	req.Header.Add("X-Forwarded-For", "203.0.113.9")
-	if got := clientIP(req, true); got != "198.51.100.7" {
-		t.Fatalf("clientIP=%q; want 198.51.100.7", got)
+	if got := forwardedIdentity(req); got != "198.51.100.7" {
+		t.Fatalf("forwardedIdentity=%q; want 198.51.100.7", got)
 	}
 }
 
-func TestClientIPPrefersCloudflareConnectingIP(t *testing.T) {
+func TestForwardedIdentityPrefersCloudflareConnectingIP(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
 	req.RemoteAddr = "192.0.2.10:1234"
 	req.Header.Set("CF-Connecting-IP", "198.51.100.8")
 	req.Header.Set("X-Forwarded-For", "198.51.100.7, 203.0.113.9")
-	if got := clientIP(req, true); got != "198.51.100.8" {
-		t.Fatalf("clientIP=%q; want 198.51.100.8", got)
+	if got := forwardedIdentity(req); got != "198.51.100.8" {
+		t.Fatalf("forwardedIdentity=%q; want 198.51.100.8", got)
 	}
 }
 
 func TestClientIPNormalizesIPv6(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
 	req.RemoteAddr = "[2001:0db8:0000:0000:0000:0000:0000:0001]:443"
-	if got := clientIP(req, false); got != "2001:db8::1" {
+	if got := clientIP(req); got != "2001:db8::1" {
 		t.Fatalf("clientIP=%q; want 2001:db8::1", got)
 	}
 	req.Header.Set("X-Forwarded-For", "2001:0DB8:0000::0002")
-	if got := clientIP(req, true); got != "2001:db8::2" {
-		t.Fatalf("clientIP=%q; want 2001:db8::2", got)
+	if got := forwardedIdentity(req); got != "2001:db8::2" {
+		t.Fatalf("forwardedIdentity=%q; want 2001:db8::2", got)
 	}
 }
 
-func TestClientIPDoesNotTrustForwardedHeadersWhenDisabled(t *testing.T) {
+func TestClientIPIgnoresForwardedHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
 	req.RemoteAddr = "192.0.2.10:1234"
 	req.Header.Set("X-Forwarded-For", "203.0.113.9")
-	if got := clientIP(req, false); got != "192.0.2.10" {
+	if got := clientIP(req); got != "192.0.2.10" {
 		t.Fatalf("clientIP=%q; want remote peer address", got)
 	}
 }

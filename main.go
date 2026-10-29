@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +14,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -30,6 +34,7 @@ var (
 	errDNSMessageTooLarge  = errors.New("dns message too large")
 	errInvalidContentType  = errors.New("invalid content type")
 	errFailedReadDNSBody   = errors.New("failed to read dns message")
+	errNoClientIdentity    = errors.New("no valid client identity from trusted proxy")
 )
 
 const (
@@ -53,6 +58,17 @@ const (
 	evictInterval         = time.Second
 	sweepInterval         = 60 * time.Second
 	logInterval           = 10 * time.Second
+	// defaultIPv6Prefix groups IPv6 clients into one rate-limit identity per
+	// routed prefix so address rotation inside a single prefix cannot mint
+	// additional windows. 0 disables grouping (exact per-address identity).
+	defaultIPv6Prefix = 64
+	maxIPv6Prefix     = 128
+	// defaultHealthRate bounds the public /healthz endpoint with its own
+	// per-client-IP budget, independent of the DoH RATE_LIMIT.
+	defaultHealthRate = 60
+	// defaultTrustHeader carries the HMAC-signed client identity from the
+	// trusted edge when TRUST_SECRET is configured.
+	defaultTrustHeader = "X-Real-Client-IP"
 )
 
 type limitResult int
@@ -197,6 +213,28 @@ func retryAfterSeconds(d time.Duration) int {
 	return max(1, int((d+time.Second-1)/time.Second))
 }
 
+// limiterKey maps a normalized client IP to its rate-limit identity. IPv4
+// addresses are always individual. IPv6 addresses are masked to the configured
+// prefix so a subscriber rotating addresses inside one routed prefix cannot
+// obtain additional windows; a prefix of 0 keeps exact per-address identities.
+func limiterKey(ip string, v6Prefix int) string {
+	if v6Prefix <= 0 {
+		return ip
+	}
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || addr.Zone() != "" {
+		return ip
+	}
+	addr = addr.Unmap()
+	if addr.Is4() {
+		return addr.String()
+	}
+	if v6Prefix > maxIPv6Prefix {
+		v6Prefix = maxIPv6Prefix
+	}
+	return netip.PrefixFrom(addr, v6Prefix).Masked().String()
+}
+
 type logGate struct {
 	mu         sync.Mutex
 	last       time.Time
@@ -248,6 +286,28 @@ type server struct {
 	capacityLog logGate
 	upstreamLog logGate
 
+	// healthLimiter bounds /healthz with its own per-client-IP budget, kept
+	// separate from the DoH budget so a public health endpoint cannot be
+	// abused as an unthrottled request driver. Nil in hand-built test servers:
+	// the health handler skips the budget when unset.
+	healthLimiter *limiter
+	// v6Prefix groups IPv6 clients into one rate-limit identity per routed
+	// prefix; 0 keeps exact per-address identities.
+	v6Prefix int
+	// trustedProxies restricts proxy-header trust to these networks. Headers
+	// from any other peer are ignored even when trustProxy is set, so
+	// TRUST_PROXY cannot be abused on a directly reachable port. Nil in
+	// hand-built test servers means no peer is trusted.
+	trustedProxies []*net.IPNet
+	// trustSecret, when non-empty, enables HMAC-SHA256 verification of the
+	// client-identity header: only a value with a valid signature from a
+	// trusted peer is used. trustHeader names that header and requireIdentity
+	// rejects (instead of peer-bucketing) a non-loopback trusted peer that
+	// presents no valid identity.
+	trustSecret    string
+	trustHeader    string
+	requireIdent   bool
+
 	// Cached readiness probe so a public health endpoint cannot force a TCP
 	// dial on every request.
 	probeMu sync.Mutex
@@ -262,6 +322,20 @@ func parseEnvInt(name string, def, upper int) int {
 	}
 	n, err := strconv.Atoi(value)
 	if err != nil || n < 1 || n > upper {
+		return def
+	}
+	return n
+}
+
+// parseEnvIPv6Prefix accepts 0 (disable grouping) through 128; anything else
+// falls back to the default.
+func parseEnvIPv6Prefix(name string, def int) int {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return def
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 0 || n > maxIPv6Prefix {
 		return def
 	}
 	return n
@@ -282,7 +356,57 @@ func parseEnvBool(name string, def bool) bool {
 	}
 }
 
-func clientIP(r *http.Request, trustProxy bool) string {
+// parseCIDRList parses a comma-separated list of IPs and CIDRs. Bare IPs are
+// treated as exact /32 (IPv4) or /128 (IPv6) matches; empty and invalid
+// entries are skipped.
+func parseCIDRList(value string) []*net.IPNet {
+	var out []*net.IPNet
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if ip := net.ParseIP(part); ip != nil {
+			bits := 128
+			if ip.To4() != nil {
+				bits = 32
+			}
+			out = append(out, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+			continue
+		}
+		if _, network, err := net.ParseCIDR(part); err == nil {
+			out = append(out, network)
+		}
+	}
+	return out
+}
+
+// defaultTrustedProxies covers the networks a platform load balancer typically
+// connects from: loopback, link-local, IPv6 ULA and the RFC 1918 private
+// ranges. Used only when TRUST_PROXY=true and TRUSTED_PROXIES is unset.
+func defaultTrustedProxies() []*net.IPNet {
+	return parseCIDRList("127.0.0.0/8, ::1/128, 169.254.0.0/16, fe80::/10, " +
+		"10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7")
+}
+
+// peerTrusted reports whether ip belongs to one of the configured trusted
+// proxy networks.
+func (s *server) peerTrusted(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	for _, network := range s.trustedProxies {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// forwardedIdentity extracts the client identity from conventional proxy
+// headers (CF-Connecting-IP, then the first valid X-Forwarded-For entry, then
+// X-Real-IP), returning "" when none carries a valid address.
+func forwardedIdentity(r *http.Request) string {
 	parse := func(value string) string {
 		ip := net.ParseIP(strings.Trim(strings.TrimSpace(value), "[]"))
 		if ip == nil {
@@ -290,35 +414,99 @@ func clientIP(r *http.Request, trustProxy bool) string {
 		}
 		return ip.String()
 	}
-	if trustProxy {
-		// Prefer the header that trusted edges use to carry the original client
-		// address. X-Forwarded-For is then interpreted using its conventional
-		// left-most client address rather than the proxy's right-most address.
-		if ip := parse(r.Header.Get("CF-Connecting-IP")); ip != "" {
-			return ip
-		}
-		for _, value := range r.Header.Values("X-Forwarded-For") {
-			// strings.Cut walks the list without allocating a slice per request.
-			for value != "" {
-				var part string
-				part, value, _ = strings.Cut(value, ",")
-				if ip := parse(part); ip != "" {
-					return ip
-				}
+	// Prefer the header that trusted edges use to carry the original client
+	// address. X-Forwarded-For is then interpreted using its conventional
+	// left-most client address rather than the proxy's right-most address.
+	if ip := parse(r.Header.Get("CF-Connecting-IP")); ip != "" {
+		return ip
+	}
+	for _, value := range r.Header.Values("X-Forwarded-For") {
+		// strings.Cut walks the list without allocating a slice per request.
+		for value != "" {
+			var part string
+			part, value, _ = strings.Cut(value, ",")
+			if ip := parse(part); ip != "" {
+				return ip
 			}
 		}
-		if ip := parse(r.Header.Get("X-Real-IP")); ip != "" {
-			return ip
-		}
 	}
+	if ip := parse(r.Header.Get("X-Real-IP")); ip != "" {
+		return ip
+	}
+	return ""
+}
+
+// peerIPString returns the bare TCP peer address of the request.
+func peerIPString(r *http.Request) string {
 	host := strings.TrimSpace(r.RemoteAddr)
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
-	if ip := parse(host); ip != "" {
-		return ip
+	return host
+}
+
+// clientIP returns the normalized TCP peer address of the request. Proxy
+// identity headers are never consulted here: clientIdentity decides when
+// forwarded headers may be trusted and extracts them via forwardedIdentity.
+func clientIP(r *http.Request) string {
+	host := peerIPString(r)
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+		return ip.String()
 	}
 	return host
+}
+
+// validIdentitySignature reports whether sig is the correct lowercase hex
+// HMAC-SHA256 of value under the shared trust secret. The signature covers
+// the exact identity header value, so a client cannot forge or tamper with
+// it without the secret.
+func validIdentitySignature(secret, value, sig string) bool {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(value))
+	expected := hex.EncodeToString(mac.Sum(nil))
+	sig = strings.TrimSpace(strings.ToLower(sig))
+	return sig != "" && hmac.Equal([]byte(expected), []byte(sig))
+}
+
+// clientIdentity resolves the rate-limit identity for a request. Proxy
+// identity headers are consulted only when the TCP peer is a configured
+// trusted proxy; loopback peers are inherently trusted so the container
+// health check keeps working without identity headers. When trustSecret is
+// configured, only the signed identity header is accepted, so a client-
+// supplied header value cannot forge an identity even if the edge forwards
+// it un-sanitized. When requireIdentity is set, a non-loopback trusted peer
+// that presents no valid identity is rejected instead of being attributed
+// to the proxy itself.
+func (s *server) clientIdentity(r *http.Request) (string, error) {
+	if !s.trustProxy {
+		return clientIP(r), nil
+	}
+	// Parse the TCP peer exactly once: the result drives both the
+	// proxy-trust decision and the loopback exemption.
+	peer := net.ParseIP(strings.Trim(peerIPString(r), "[]"))
+	loopback := peer != nil && peer.IsLoopback()
+	if !loopback && !s.peerTrusted(peer) {
+		// Untrusted peer: never honor proxy headers.
+		return clientIP(r), nil
+	}
+	var ident string
+	if s.trustSecret != "" {
+		value := strings.TrimSpace(r.Header.Get(s.trustHeader))
+		if value != "" && validIdentitySignature(s.trustSecret, value, r.Header.Get(s.trustHeader+"-Sig")) {
+			if ip := net.ParseIP(strings.Trim(value, "[]")); ip != nil {
+				ident = ip.String()
+			}
+		}
+	} else {
+		ident = forwardedIdentity(r)
+	}
+	if ident != "" {
+		return ident, nil
+	}
+	if s.requireIdent && !loopback {
+		return "", errNoClientIdentity
+	}
+	return clientIP(r), nil
 }
 
 func (s *server) backendReady() bool {
@@ -342,12 +530,32 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	// The health endpoint is public, so it gets its own coarse per-client-IP
+	// budget (independent of the DoH budget) on top of the cached probe. A nil
+	// healthLimiter (hand-built test servers) disables the budget.
+	if s.healthLimiter != nil {
+		ip, identErr := s.clientIdentity(r)
+		if identErr != nil {
+			writeGatewayError(w, http.StatusServiceUnavailable, "client identity unavailable")
+			return
+		}
+		decision, retryAfter := s.healthLimiter.check(ip)
+		if decision != limitAllowed {
+			if decision == limitRateLimited {
+				w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(retryAfter)))
+			}
+			writeGatewayError(w, http.StatusTooManyRequests, "rate limit exceeded")
+			return
+		}
+	}
 	if !s.backendReady() {
 		writeGatewayError(w, http.StatusServiceUnavailable, "dns backend unavailable")
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	// Explicit length keeps the 2-byte body off the chunked-encoding path.
+	w.Header().Set("Content-Length", "2")
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodGet {
 		_, _ = w.Write([]byte("ok"))
@@ -489,10 +697,6 @@ func walkDNSName(message []byte, offset int, canonical *[]byte) (int, error) {
 	}
 }
 
-func skipDNSName(message []byte, offset int) (int, error) {
-	return walkDNSName(message, offset, nil)
-}
-
 // canonicalNameBufPool recycles the scratch buffers used to build canonical
 // wire names, avoiding a fresh allocation per DNS question comparison.
 var canonicalNameBufPool = sync.Pool{
@@ -552,7 +756,7 @@ func validateDNSMessage(message []byte, response bool) error {
 	if 5+records*11 > len(message)-12 {
 		return errors.New("dns section counts exceed message size")
 	}
-	offset, err := skipDNSName(message, 12)
+	offset, err := walkDNSName(message, 12, nil)
 	if err != nil {
 		return err
 	}
@@ -561,7 +765,7 @@ func validateDNSMessage(message []byte, response bool) error {
 	}
 	offset += 4
 	for i := 0; i < records; i++ {
-		offset, err = skipDNSName(message, offset)
+		offset, err = walkDNSName(message, offset, nil)
 		if err != nil {
 			return err
 		}
@@ -635,9 +839,19 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	}
 	// The rate-limit budget is charged only after body validation, so malformed
 	// requests do not consume a client's window; the concurrency gate above
-	// still bounds body parsing and upstream work.
-	ip := clientIP(r, s.trustProxy)
-	decision, retryAfter := s.limiter.check(ip)
+	// still bounds body parsing and upstream work. Proxy identity headers are
+	// honored only when the TCP peer is a configured trusted proxy, so this
+	// setting cannot be abused on a directly reachable port; a trusted peer
+	// without a valid identity is rejected in strict mode instead of being
+	// bucketed under the proxy.
+	ip, identErr := s.clientIdentity(r)
+	if identErr != nil {
+		writeGatewayError(w, http.StatusServiceUnavailable, "client identity unavailable")
+		return
+	}
+	// IPv6 clients share one rate window per configured prefix, so rotating
+	// addresses inside a single routed prefix cannot mint additional windows.
+	decision, retryAfter := s.limiter.check(limiterKey(ip, s.v6Prefix))
 	switch decision {
 	case limitAllowed:
 	case limitRateLimited:
@@ -740,6 +954,26 @@ func main() {
 	maxClients := parseEnvInt("MAX_CLIENTS", defaultMaxClients, maxLimiterClients)
 	maxConcurrent := parseEnvInt("MAX_CONCURRENT", defaultMaxConcurrent, defaultMaxConcurrent)
 	trustProxy := parseEnvBool("TRUST_PROXY", false)
+	v6Prefix := parseEnvIPv6Prefix("IPV6_PREFIX", defaultIPv6Prefix)
+	healthRate := parseEnvInt("HEALTH_RATE", defaultHealthRate, maxRateLimit)
+	// Proxy identity headers are honored only from these networks. When
+	// TRUST_PROXY=true and none are configured, trust the ranges a platform
+	// load balancer typically connects from; when TRUST_PROXY=false, never
+	// trust headers regardless of TRUSTED_PROXIES.
+	trustedProxies := parseCIDRList(os.Getenv("TRUSTED_PROXIES"))
+	if trustProxy && len(trustedProxies) == 0 {
+		trustedProxies = defaultTrustedProxies()
+	}
+	// Optional shared secret enabling HMAC-SHA256 verification of the edge-
+	// supplied client identity header; empty keeps the conventional headers.
+	trustSecret := strings.TrimSpace(os.Getenv("TRUST_SECRET"))
+	trustHeader := strings.TrimSpace(os.Getenv("TRUST_HEADER"))
+	if trustHeader == "" {
+		trustHeader = defaultTrustHeader
+	}
+	// Strict identity: reject (rather than peer-bucket) requests from a
+	// non-loopback trusted proxy that carries no valid identity.
+	requireIdent := parseEnvBool("TRUST_REQUIRE_IDENTITY", true)
 	lim := newLimiter(rate, defaultWindow, maxClients)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -762,9 +996,15 @@ func main() {
 		},
 		backendURL:  defaultBackendURL,
 		backendAddr: defaultBackendAddr,
-		limiter:     lim,
-		concurrent:  make(chan struct{}, maxConcurrent),
-		trustProxy:  trustProxy,
+		limiter:        lim,
+		concurrent:     make(chan struct{}, maxConcurrent),
+		trustProxy:     trustProxy,
+		healthLimiter:  newLimiter(healthRate, defaultWindow, maxClients),
+		v6Prefix:       v6Prefix,
+		trustedProxies: trustedProxies,
+		trustSecret:    trustSecret,
+		trustHeader:    trustHeader,
+		requireIdent:   requireIdent,
 	}
 	srv := &http.Server{
 		Addr:              port,
@@ -775,7 +1015,7 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    maxHeaderBytes,
 	}
-	log.Printf("DoH gateway listening on %s; rate=%d requests/%s sliding window; maxClients=%d; maxConcurrent=%d; trustProxy=%t", port, rate, defaultWindow, maxClients, maxConcurrent, trustProxy)
+	log.Printf("DoH gateway listening on %s; rate=%d requests/%s sliding window; maxClients=%d; maxConcurrent=%d; trustProxy=%t; ipv6Prefix=/%d; healthRate=%d; trustedProxies=%d; trustSecret=%t; requireIdentity=%t", port, rate, defaultWindow, maxClients, maxConcurrent, trustProxy, v6Prefix, healthRate, len(trustedProxies), trustSecret != "", requireIdent)
 	serveErr := make(chan error, 1)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
