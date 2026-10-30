@@ -37,12 +37,55 @@ BLOCKY_CONFIG=/etc/blocky/config.yml
 # intended way to iterate them.
 # shellcheck disable=SC2013
 for value in $(awk '
-  /^ports:/ { inports=1; next }
-  inports && /^[^[:space:]]/ { inports=0 }
-  inports && /^[[:space:]]+(dns|http|tls|https):/ {
-    sub(/^[[:space:]]*(dns|http|tls|https):[[:space:]]*/, "")
-    sub(/[[:space:]]+#.*$/, "")
-    print
+  # Blocky accepts scalar, inline-list and block-list listener addresses.
+  # Emit each address so every configured port is checked independently.
+  function emit_values(value, count, values, i) {
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+    if (value == "") return
+    if (substr(value, 1, 1) == "[" && substr(value, length(value), 1) == "]") {
+      value = substr(value, 2, length(value) - 2)
+      count = split(value, values, ",")
+    } else {
+      values[1] = value
+      count = 1
+    }
+    for (i = 1; i <= count; i++) {
+      gsub(/^[[:space:]\047"]+|[[:space:]\047"]+$/, "", values[i])
+      if (values[i] != "") print values[i]
+    }
+  }
+
+  {
+    line = $0
+    if (line ~ /^ports:[[:space:]]*(#.*)?$/) {
+      inports = 1
+      listener = 0
+      next
+    }
+    if (inports && line ~ /^[^[:space:]#]/) {
+      inports = 0
+      listener = 0
+    }
+    if (!inports) next
+
+    if (line ~ /^[[:space:]]+(dns|http|tls|https):/) {
+      listener = 1
+      value = line
+      sub(/^[[:space:]]*(dns|http|tls|https):[[:space:]]*/, "", value)
+      sub(/[[:space:]]+#.*$/, "", value)
+      emit_values(value)
+      next
+    }
+    if (line ~ /^[[:space:]]+[[:alnum:]_-]+:/) {
+      listener = 0
+      next
+    }
+    if (listener && line ~ /^[[:space:]]+-[[:space:]]*/) {
+      value = line
+      sub(/^[[:space:]]*-[[:space:]]*/, "", value)
+      sub(/[[:space:]]+#.*$/, "", value)
+      emit_values(value)
+    }
   }
 ' "$BLOCKY_CONFIG"); do
   require_unprivileged "$BLOCKY_CONFIG listener" "$value"

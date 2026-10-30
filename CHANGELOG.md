@@ -4,21 +4,37 @@ Entries use the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) style. 
 
 ## [Unreleased] - 2026-10-30
 
-Maintenance and correctness pass after reading every project file and the full test suite. No project version was changed.
+Second full-project audit: all 13 files read end to end (gateway, tests,
+Dockerfile, entrypoint, configs, CI workflow, docs), followed by static
+cross-checks — a symbol-reference scan (every function, variable, constant
+and type in `main.go` is referenced from code or tests; all 76 tests and 6
+test helpers are exercised), arithmetic verification of the documented bounds
+(GET raw-query bound 10,927 characters, resource-record cap 743), and a
+claim-by-claim pass of the README against the code, tests, `config.yml` and
+`entrypoint.sh`. No functional behavior changed; the public API, status-code
+matrix and configuration surface are unchanged.
 
 ### Fixed
 
-- `/healthz` now returns `503` when its client-state table is full, reserving `429` and `Retry-After` for identities that actually exceed their health request budget.
-- `/healthz` now applies the configured IPv6 prefix grouping, preventing address rotation within one routed prefix from multiplying the health request budget or filling the table with duplicate identities.
-- Upstream response-body read timeouts now return `504` like request and response-header timeouts; ordinary invalid or failed upstream responses remain `502`.
-- An unexpected upstream transport cancellation now returns `502` while the client request is still active; only cancellation of the client request itself exits without attempting a response.
-- `TRUSTED_PROXIES` now uses the broad loopback/link-local/private-network defaults only when the variable is unset. An explicitly empty or all-invalid value trusts no non-loopback proxy networks instead of silently widening trust; loopback remains an explicit local-trust exception.
+- Precision fix in `README.md` and the `maxDNSResourceRecords` comment in
+  `main.go`: 743 is the maximum *uncompressed* record count that fits an
+  8,192-byte message (compression pointers would allow more); the cap itself
+  is unchanged and remains correct as a conservative bound.
 
-### Changed
+### Verified (no changes required)
 
-- Peer address parsing and normalization are shared so `clientIdentity` parses the TCP peer once and reuses the normalized address for trust checks and fallback identity; scoped IPv6 zone identifiers are stripped before trust matching and rate grouping.
-- Signed proxy identities now verify the exact supplied header value and enforce the documented lowercase hexadecimal signature format before parsing the IP.
-- The health limiter now runs the same periodic idle-state cleanup as the DoH limiter, avoiding retention of stale health identities until the table reaches capacity.
-- The DNS resource-record ceiling is now derived from the 8,192-byte wire-message bound (743 minimum-size records), removing an unreachable 4,096-record allowance.
-- Added regression coverage for upstream response-body timeouts and unexpected transport cancellation alongside health limiter capacity and IPv6 prefix grouping, explicit trusted-proxy configuration, trusted versus untrusted peers, strict identity handling, loopback trust and fallback, and signed identity verification.
-- Updated the README for health status and IPv6 identity behavior, trusted-proxy fail-closed behavior and loopback exception, limiter-state retention, separate DoH/health client-state table limits, and consistent upstream timeout status handling.
+- Bugs: none found. Re-traced the sliding-window limiter (lock ordering,
+  eviction safety), strict base64url GET decoding, DNS wire validation,
+  upstream response verification, timeout classification and graceful shutdown.
+- Dead/redundant code: none — `clientIP()` is retained because tests exercise
+  it directly; the previously removed unreachable `/healthz` default branch
+  stays removed.
+- Conflicts: none — `go.mod` matches the Dockerfile builder, the
+  `.dockerignore` allow-list matches the Dockerfile `COPY` set, and README
+  claims re-verified against code, tests, `config.yml` and `entrypoint.sh`.
+- Optimizations assessed and rejected: passing `netip.Addr` through
+  `clientIdentity`/`limiterKey` to avoid one IP re-parse per request remains
+  negligible and disruptive to test-facing signatures; the existing
+  optimizations (lazy limiter maps, pooled canonical-name buffers,
+  binary-search expiry, cached health probe, throttled logging) are confirmed
+  in place.

@@ -649,6 +649,21 @@ func TestDoHOptionsHandler(t *testing.T) {
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Fatalf("Access-Control-Allow-Origin=%q; want *", got)
 	}
+	if got := rec.Header().Get("Access-Control-Allow-Methods"); got != "GET, POST, OPTIONS" {
+		t.Fatalf("Access-Control-Allow-Methods=%q; want GET, POST, OPTIONS", got)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Headers"); got != "accept, content-type" {
+		t.Fatalf("Access-Control-Allow-Headers=%q; want accept, content-type", got)
+	}
+	if got := rec.Header().Get("Access-Control-Max-Age"); got != corsPreflightMaxAge {
+		t.Fatalf("Access-Control-Max-Age=%q; want %s", got, corsPreflightMaxAge)
+	}
+	if got := rec.Header().Get("Access-Control-Expose-Headers"); got != "Retry-After" {
+		t.Fatalf("Access-Control-Expose-Headers=%q; want Retry-After", got)
+	}
+	if got := len(s.concurrent); got != 0 {
+		t.Fatalf("OPTIONS preflight occupied %d DNS concurrency slot(s); want 0", got)
+	}
 }
 
 func TestGatewayRejectsOtherPaths(t *testing.T) {
@@ -686,6 +701,12 @@ func TestDoHRateLimitExceeded(t *testing.T) {
 	rec := postDoH(s, query, "")
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("third request status=%d; want 429, body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("429 Access-Control-Allow-Origin=%q; want *", got)
+	}
+	if got := rec.Header().Get("Access-Control-Expose-Headers"); got != "Retry-After" {
+		t.Fatalf("429 Access-Control-Expose-Headers=%q; want Retry-After", got)
 	}
 	secs, err := strconv.Atoi(rec.Header().Get("Retry-After"))
 	if err != nil || secs < 1 || secs > 60 {
@@ -856,6 +877,9 @@ func TestDoHRejectsInvalidInputBeforeBackend(t *testing.T) {
 			if rec.Code != tc.status {
 				t.Fatalf("status=%d; want %d, body=%q", rec.Code, tc.status, rec.Body.String())
 			}
+			if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+				t.Fatalf("error response Access-Control-Allow-Origin=%q; want *", got)
+			}
 		})
 	}
 	if backendCalls != 0 {
@@ -949,6 +973,9 @@ func TestDoHRejectsInvalidUpstreamResponse(t *testing.T) {
 			rec := postDoH(s, query, "")
 			if rec.Code != http.StatusBadGateway {
 				t.Fatalf("status=%d; want 502, body=%q", rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+				t.Fatalf("502 Access-Control-Allow-Origin=%q; want *", got)
 			}
 		})
 	}
@@ -1502,6 +1529,9 @@ func TestConfiguredTrustedProxiesUsesDefaultsOnlyWhenUnset(t *testing.T) {
 	}
 	if !(&server{trustedProxies: defaults}).peerTrusted(net.ParseIP("10.1.2.3")) {
 		t.Fatal("default trusted networks should include RFC 1918 private ranges")
+	}
+	if (&server{trustedProxies: defaults}).peerTrusted(net.ParseIP("127.0.0.1")) {
+		t.Fatal("loopback should be trusted separately, not duplicated in the default CIDR list")
 	}
 
 	explicit := configuredTrustedProxies(true, "192.0.2.10,not-a-network", true)

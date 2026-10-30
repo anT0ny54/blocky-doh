@@ -49,7 +49,8 @@ RUN go vet ./... && \
 # second copy of the large Blocky binary.
 COPY config.yml entrypoint.sh /out/
 
-RUN chmod 0555 /out/doh-gateway /out/entrypoint.sh /bin/blocky && \
+RUN sh -n /out/entrypoint.sh && \
+    chmod 0555 /out/doh-gateway /out/entrypoint.sh /bin/blocky && \
     chmod 0444 /out/config.yml
 
 # ------------------------------------------------------------

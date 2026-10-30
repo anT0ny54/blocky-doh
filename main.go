@@ -49,7 +49,8 @@ const (
 	maxLimiterClients    = 32768
 	maxDNSBody           = 8192
 	// Header + minimum question + minimum resource-record size. This is the
-	// largest record count that can fit in the gateway's bounded DNS message.
+	// largest uncompressed record count that can fit in the gateway's bounded
+	// DNS message.
 	maxDNSResourceRecords = (maxDNSBody - 12 - 5) / 11
 	clientIdleTTL         = 2 * time.Minute
 	maxDNSNameHops        = 255
@@ -68,6 +69,9 @@ const (
 	// defaultHealthRate bounds the public /healthz endpoint with its own
 	// per-client-identity budget, independent of the DoH RATE_LIMIT.
 	defaultHealthRate = 60
+	// corsPreflightMaxAge lets browsers reuse the fixed CORS policy without
+	// repeatedly spending a request on an OPTIONS preflight.
+	corsPreflightMaxAge = "600"
 	// defaultTrustHeader carries the HMAC-signed client identity from the
 	// trusted edge when TRUST_SECRET is configured.
 	defaultTrustHeader = "X-Real-Client-IP"
@@ -382,11 +386,13 @@ func parseCIDRList(value string) []*net.IPNet {
 	return out
 }
 
-// defaultTrustedProxies covers the networks a platform load balancer typically
-// connects from: loopback, link-local, IPv6 ULA and the RFC 1918 private
-// ranges. Used only when TRUST_PROXY=true and TRUSTED_PROXIES is unset.
+// defaultTrustedProxies covers the non-loopback networks a platform load
+// balancer typically connects from: link-local, IPv6 ULA and RFC 1918 private
+// ranges. Loopback peers are trusted separately by clientIdentity, so they do
+// not need duplicate entries here. Used only when TRUST_PROXY=true and
+// TRUSTED_PROXIES is unset.
 func defaultTrustedProxies() []*net.IPNet {
-	return parseCIDRList("127.0.0.0/8, ::1/128, 169.254.0.0/16, fe80::/10, " +
+	return parseCIDRList("169.254.0.0/16, fe80::/10, " +
 		"10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7")
 }
 
@@ -573,9 +579,6 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 			writeGatewayError(w, http.StatusTooManyRequests, "rate limit exceeded")
 			return
 		case limitCapacity:
-			writeGatewayError(w, http.StatusServiceUnavailable, "server busy")
-			return
-		default:
 			writeGatewayError(w, http.StatusServiceUnavailable, "server busy")
 			return
 		}
@@ -831,10 +834,14 @@ func isTimeoutError(err error) bool {
 }
 
 func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
+	// Keep browser clients able to inspect both successful DNS replies and
+	// gateway errors. This public endpoint never enables credentialed CORS.
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Expose-Headers", "Retry-After")
 	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "accept, content-type")
+		w.Header().Set("Access-Control-Max-Age", corsPreflightMaxAge)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -981,7 +988,6 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	releaseSlot()
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/dns-message")
 	// Explicit length avoids chunked encoding for responses over Go's 2 KiB
