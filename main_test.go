@@ -2,7 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -426,13 +430,15 @@ func TestValidateDNSMessageRequiresExactlyOneQuestion(t *testing.T) {
 	}
 }
 
-func testDNSResponseWithAnswerRecords(query []byte, count int) []byte {
+func testDNSResponseWithAnswerRecords(count int) []byte {
 	message := []byte{
-		query[0], query[1], 0x81, 0x80,
+		0x12, 0x34, 0x81, 0x80,
 		0x00, 0x01, byte(count >> 8), byte(count),
 		0x00, 0x00, 0x00, 0x00,
 	}
-	message = append(message, query[12:]...)
+	// Use the minimum-size root question so the record-count boundary also
+	// proves the largest possible message that fits maxDNSBody.
+	message = append(message, 0x00, 0x00, 0x01, 0x00, 0x01)
 	for i := 0; i < count; i++ {
 		message = append(message,
 			0x00,
@@ -445,12 +451,14 @@ func testDNSResponseWithAnswerRecords(query []byte, count int) []byte {
 }
 
 func TestValidateDNSMessageEnforcesResourceRecordCeiling(t *testing.T) {
-	query := testDNSQuery(0x16)
-	withinLimit := testDNSResponseWithAnswerRecords(query, maxDNSResourceRecords)
+	withinLimit := testDNSResponseWithAnswerRecords(maxDNSResourceRecords)
+	if len(withinLimit) > maxDNSBody {
+		t.Fatalf("boundary test message length=%d; maximum is %d", len(withinLimit), maxDNSBody)
+	}
 	if err := validateDNSMessage(withinLimit, true); err != nil {
 		t.Fatalf("response with %d records rejected: %v", maxDNSResourceRecords, err)
 	}
-	overLimit := testDNSResponseWithAnswerRecords(query, maxDNSResourceRecords+1)
+	overLimit := testDNSResponseWithAnswerRecords(maxDNSResourceRecords + 1)
 	if err := validateDNSMessage(overLimit, true); err == nil {
 		t.Fatalf("response with %d records was accepted", maxDNSResourceRecords+1)
 	}
@@ -946,6 +954,58 @@ func TestDoHRejectsInvalidUpstreamResponse(t *testing.T) {
 	}
 }
 
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+type timeoutReadCloser struct{}
+
+func (timeoutReadCloser) Read([]byte) (int, error) { return 0, context.DeadlineExceeded }
+func (timeoutReadCloser) Close() error             { return nil }
+
+func TestDoHUpstreamBodyTimeoutReturns504(t *testing.T) {
+	query := testDNSQuery(0x66)
+	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the custom transport must handle this request")
+	})
+	defer cleanup()
+	s.client = &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": []string{"application/dns-message"}},
+			Body:          timeoutReadCloser{},
+			ContentLength: -1,
+			Request:       r,
+		}, nil
+	})}
+
+	rec := postDoH(s, query, "")
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status=%d; want 504 for upstream response-body timeout, body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDoHUnexpectedUpstreamCancellationReturns502(t *testing.T) {
+	query := testDNSQuery(0x67)
+	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the custom transport must handle this request")
+	})
+	defer cleanup()
+	s.client = &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Context().Err() != nil {
+			t.Errorf("request context unexpectedly canceled before RoundTrip: %v", r.Context().Err())
+		}
+		return nil, context.Canceled
+	})}
+
+	rec := postDoH(s, query, "")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d; want 502 for an upstream cancellation while the client request is active, body=%q", rec.Code, rec.Body.String())
+	}
+}
+
 func TestDoHUpstreamTimeoutReturns504(t *testing.T) {
 	query := testDNSQuery(0x64)
 	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1123,6 +1183,13 @@ func TestClientIPNormalizesIPv6(t *testing.T) {
 	req.Header.Set("X-Forwarded-For", "2001:0DB8:0000::0002")
 	if got := forwardedIdentity(req); got != "2001:db8::2" {
 		t.Fatalf("forwardedIdentity=%q; want 2001:db8::2", got)
+	}
+	req.RemoteAddr = "[fe80::1%eth0]:443"
+	if got := clientIP(req); got != "fe80::1" {
+		t.Fatalf("clientIP with IPv6 zone=%q; want fe80::1", got)
+	}
+	if got := limiterKey(clientIP(req), 64); got != "fe80::/64" {
+		t.Fatalf("limiterKey with IPv6 zone=%q; want fe80::/64", got)
 	}
 }
 
@@ -1425,5 +1492,217 @@ func TestDecodeDoHGETRejectsCRAndLF(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/dns-query?dns="+encoded, nil)
 	if got, err := decodeDoHQuery(httptest.NewRecorder(), req); err != nil || !bytes.Equal(got, testDNSQuery(0x97)) {
 		t.Fatalf("clean GET value: got=%v err=%v", got, err)
+	}
+}
+
+func TestConfiguredTrustedProxiesUsesDefaultsOnlyWhenUnset(t *testing.T) {
+	defaults := configuredTrustedProxies(true, "", false)
+	if len(defaults) == 0 {
+		t.Fatal("unset TRUSTED_PROXIES should use the documented platform defaults")
+	}
+	if !(&server{trustedProxies: defaults}).peerTrusted(net.ParseIP("10.1.2.3")) {
+		t.Fatal("default trusted networks should include RFC 1918 private ranges")
+	}
+
+	explicit := configuredTrustedProxies(true, "192.0.2.10,not-a-network", true)
+	if len(explicit) != 1 || !(&server{trustedProxies: explicit}).peerTrusted(net.ParseIP("192.0.2.10")) {
+		t.Fatalf("explicit trusted network list was not applied: %v", explicit)
+	}
+	if (&server{trustedProxies: explicit}).peerTrusted(net.ParseIP("10.1.2.3")) {
+		t.Fatal("explicit trusted network list unexpectedly inherited private-network defaults")
+	}
+
+	for _, value := range []string{"", "not-a-network"} {
+		got := configuredTrustedProxies(true, value, true)
+		if len(got) != 0 {
+			t.Fatalf("explicit TRUSTED_PROXIES=%q should fail closed, got %v", value, got)
+		}
+	}
+	if got := configuredTrustedProxies(false, "192.0.2.10", true); len(got) != 0 {
+		t.Fatalf("TRUST_PROXY=false should disable trusted networks, got %v", got)
+	}
+}
+
+func TestClientIdentityTrustsHeadersOnlyFromConfiguredPeers(t *testing.T) {
+	s := &server{
+		trustProxy:     true,
+		trustedProxies: parseCIDRList("192.0.2.0/24"),
+		requireIdent:   true,
+	}
+
+	trustedReq := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
+	trustedReq.RemoteAddr = "192.0.2.10:443"
+	trustedReq.Header.Set("X-Forwarded-For", "198.51.100.7")
+	if got, err := s.clientIdentity(trustedReq); err != nil || got != "198.51.100.7" {
+		t.Fatalf("trusted peer identity=(%q, %v); want (198.51.100.7, nil)", got, err)
+	}
+
+	untrustedReq := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
+	untrustedReq.RemoteAddr = "203.0.113.10:443"
+	untrustedReq.Header.Set("X-Forwarded-For", "198.51.100.7")
+	if got, err := s.clientIdentity(untrustedReq); err != nil || got != "203.0.113.10" {
+		t.Fatalf("untrusted peer identity=(%q, %v); want TCP peer 203.0.113.10", got, err)
+	}
+}
+
+func TestClientIdentityNormalizesScopedIPv6ProxyPeers(t *testing.T) {
+	s := &server{
+		trustProxy:     true,
+		trustedProxies: parseCIDRList("fe80::/10"),
+		requireIdent:   true,
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
+	req.RemoteAddr = "[fe80::1%eth0]:443"
+	req.Header.Set("X-Forwarded-For", "198.51.100.7")
+	if got, err := s.clientIdentity(req); err != nil || got != "198.51.100.7" {
+		t.Fatalf("scoped IPv6 trusted peer identity=(%q, %v); want (198.51.100.7, nil)", got, err)
+	}
+}
+
+func TestClientIdentityTrustsLoopbackEvenWhenTrustedProxyListIsEmpty(t *testing.T) {
+	s := &server{
+		trustProxy:     true,
+		trustedProxies: configuredTrustedProxies(true, "", true),
+		requireIdent:   true,
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
+	req.RemoteAddr = "127.0.0.1:443"
+	req.Header.Set("X-Forwarded-For", "198.51.100.7")
+	if got, err := s.clientIdentity(req); err != nil || got != "198.51.100.7" {
+		t.Fatalf("loopback peer identity=(%q, %v); want (198.51.100.7, nil)", got, err)
+	}
+}
+
+func TestClientIdentityRequiresIdentityFromNonLoopbackTrustedPeer(t *testing.T) {
+	s := &server{
+		trustProxy:     true,
+		trustedProxies: parseCIDRList("192.0.2.0/24"),
+		requireIdent:   true,
+	}
+	trustedReq := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
+	trustedReq.RemoteAddr = "192.0.2.10:443"
+	if got, err := s.clientIdentity(trustedReq); got != "" || !errors.Is(err, errNoClientIdentity) {
+		t.Fatalf("missing trusted identity=(%q, %v); want errNoClientIdentity", got, err)
+	}
+
+	loopbackReq := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
+	loopbackReq.RemoteAddr = "[::1]"
+	if got, err := s.clientIdentity(loopbackReq); err != nil || got != "::1" {
+		t.Fatalf("bare loopback identity=(%q, %v); want (::1, nil)", got, err)
+	}
+}
+
+func TestClientIdentityRequiresValidSignatureWhenSecretIsConfigured(t *testing.T) {
+	const secret = "test-shared-secret"
+	const identity = "198.51.100.7"
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(identity))
+	signature := hex.EncodeToString(mac.Sum(nil))
+
+	s := &server{
+		trustProxy:     true,
+		trustedProxies: parseCIDRList("192.0.2.0/24"),
+		trustSecret:    secret,
+		trustHeader:    defaultTrustHeader,
+		requireIdent:   true,
+	}
+	validReq := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
+	validReq.RemoteAddr = "192.0.2.10:443"
+	validReq.Header.Set(defaultTrustHeader, identity)
+	validReq.Header.Set(defaultTrustHeader+"-Sig", signature)
+	if got, err := s.clientIdentity(validReq); err != nil || got != identity {
+		t.Fatalf("valid signed identity=(%q, %v); want (%s, nil)", got, err, identity)
+	}
+
+	// The signature covers the exact header value, including surrounding
+	// whitespace; only after verification is the IP value normalized.
+	const spacedIdentity = " 198.51.100.7 "
+	spacedMAC := hmac.New(sha256.New, []byte(secret))
+	_, _ = spacedMAC.Write([]byte(spacedIdentity))
+	spacedReq := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
+	spacedReq.RemoteAddr = "192.0.2.10:443"
+	spacedReq.Header.Set(defaultTrustHeader, spacedIdentity)
+	spacedReq.Header.Set(defaultTrustHeader+"-Sig", hex.EncodeToString(spacedMAC.Sum(nil)))
+	if got, err := s.clientIdentity(spacedReq); err != nil || got != identity {
+		t.Fatalf("exact-value signed identity=(%q, %v); want (%s, nil)", got, err, identity)
+	}
+
+	invalidReq := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
+	invalidReq.RemoteAddr = "192.0.2.10:443"
+	invalidReq.Header.Set(defaultTrustHeader, identity)
+	invalidReq.Header.Set(defaultTrustHeader+"-Sig", "invalid")
+	invalidReq.Header.Set("CF-Connecting-IP", identity)
+	if got, err := s.clientIdentity(invalidReq); got != "" || !errors.Is(err, errNoClientIdentity) {
+		t.Fatalf("invalid signed identity=(%q, %v); want errNoClientIdentity", got, err)
+	}
+
+	uppercaseReq := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
+	uppercaseReq.RemoteAddr = "192.0.2.10:443"
+	uppercaseReq.Header.Set(defaultTrustHeader, identity)
+	uppercaseReq.Header.Set(defaultTrustHeader+"-Sig", strings.ToUpper(signature))
+	if got, err := s.clientIdentity(uppercaseReq); got != "" || !errors.Is(err, errNoClientIdentity) {
+		t.Fatalf("uppercase signed identity=(%q, %v); want errNoClientIdentity", got, err)
+	}
+}
+
+func TestHealthLimiterGroupsIPv6ClientsByConfiguredPrefix(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	s := &server{
+		backendAddr:   ln.Addr().String(),
+		healthLimiter: newLimiter(1, time.Minute, 4),
+		v6Prefix:      64,
+	}
+	request := func(remoteAddr string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
+		req.RemoteAddr = remoteAddr
+		rec := httptest.NewRecorder()
+		s.health(rec, req)
+		return rec
+	}
+
+	if rec := request("[2001:db8:1234:5678::1]:1000"); rec.Code != http.StatusOK {
+		t.Fatalf("first health request status=%d; want 200", rec.Code)
+	}
+	if rec := request("[2001:db8:1234:5678::2]:1001"); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("rotated IPv6 address in the same /64 status=%d; want 429", rec.Code)
+	}
+}
+
+func TestHealthLimiterDistinguishesRateLimitFromCapacity(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	s := &server{
+		backendAddr:   ln.Addr().String(),
+		healthLimiter: newLimiter(1, time.Minute, 1),
+	}
+	request := func(remoteAddr string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "http://gateway.test/healthz", nil)
+		req.RemoteAddr = remoteAddr
+		rec := httptest.NewRecorder()
+		s.health(rec, req)
+		return rec
+	}
+
+	if rec := request("198.51.100.1:1000"); rec.Code != http.StatusOK {
+		t.Fatalf("first health request status=%d; want 200", rec.Code)
+	}
+	if rec := request("198.51.100.1:1001"); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("over-budget health request status=%d; want 429", rec.Code)
+	} else if rec.Header().Get("Retry-After") == "" {
+		t.Fatal("rate-limited health request is missing Retry-After")
+	}
+	if rec := request("198.51.100.2:1002"); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("new health client at capacity status=%d; want 503", rec.Code)
+	} else if got := rec.Header().Get("Retry-After"); got != "" {
+		t.Fatalf("capacity rejection Retry-After=%q; want no per-client retry delay", got)
 	}
 }

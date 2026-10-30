@@ -38,17 +38,19 @@ var (
 )
 
 const (
-	defaultPort           = "8080"
-	defaultBackendAddr    = "127.0.0.1:8053"
-	defaultBackendURL     = "http://" + defaultBackendAddr + "/dns-query"
-	defaultRate           = 99
-	defaultWindow         = 60 * time.Second
-	defaultMaxClients     = 8192
-	defaultMaxConcurrent  = 8 // also the hard cap: MAX_CONCURRENT can only lower it
-	maxRateLimit          = 256
-	maxLimiterClients     = 32768
-	maxDNSBody            = 8192
-	maxDNSResourceRecords = 4096
+	defaultPort          = "8080"
+	defaultBackendAddr   = "127.0.0.1:8053"
+	defaultBackendURL    = "http://" + defaultBackendAddr + "/dns-query"
+	defaultRate          = 99
+	defaultWindow        = 60 * time.Second
+	defaultMaxClients    = 8192
+	defaultMaxConcurrent = 8 // also the hard cap: MAX_CONCURRENT can only lower it
+	maxRateLimit         = 256
+	maxLimiterClients    = 32768
+	maxDNSBody           = 8192
+	// Header + minimum question + minimum resource-record size. This is the
+	// largest record count that can fit in the gateway's bounded DNS message.
+	maxDNSResourceRecords = (maxDNSBody - 12 - 5) / 11
 	clientIdleTTL         = 2 * time.Minute
 	maxDNSNameHops        = 255
 	maxDNSNameLength      = 255
@@ -64,7 +66,7 @@ const (
 	defaultIPv6Prefix = 64
 	maxIPv6Prefix     = 128
 	// defaultHealthRate bounds the public /healthz endpoint with its own
-	// per-client-IP budget, independent of the DoH RATE_LIMIT.
+	// per-client-identity budget, independent of the DoH RATE_LIMIT.
 	defaultHealthRate = 60
 	// defaultTrustHeader carries the HMAC-signed client identity from the
 	// trusted edge when TRUST_SECRET is configured.
@@ -218,15 +220,14 @@ func retryAfterSeconds(d time.Duration) int {
 // prefix so a subscriber rotating addresses inside one routed prefix cannot
 // obtain additional windows; a prefix of 0 keeps exact per-address identities.
 func limiterKey(ip string, v6Prefix int) string {
-	if v6Prefix <= 0 {
-		return ip
-	}
 	addr, err := netip.ParseAddr(ip)
-	if err != nil || addr.Zone() != "" {
+	if err != nil {
 		return ip
 	}
-	addr = addr.Unmap()
-	if addr.Is4() {
+	// A zone selects the local interface for routing; it is not part of the
+	// remote client's address or its rate-limit identity.
+	addr = addr.WithZone("").Unmap()
+	if addr.Is4() || v6Prefix <= 0 {
 		return addr.String()
 	}
 	if v6Prefix > maxIPv6Prefix {
@@ -286,7 +287,7 @@ type server struct {
 	capacityLog logGate
 	upstreamLog logGate
 
-	// healthLimiter bounds /healthz with its own per-client-IP budget, kept
+	// healthLimiter bounds /healthz with its own per-client-identity budget, kept
 	// separate from the DoH budget so a public health endpoint cannot be
 	// abused as an unthrottled request driver. Nil in hand-built test servers:
 	// the health handler skips the budget when unset.
@@ -304,9 +305,9 @@ type server struct {
 	// trusted peer is used. trustHeader names that header and requireIdentity
 	// rejects (instead of peer-bucketing) a non-loopback trusted peer that
 	// presents no valid identity.
-	trustSecret    string
-	trustHeader    string
-	requireIdent   bool
+	trustSecret  string
+	trustHeader  string
+	requireIdent bool
 
 	// Cached readiness probe so a public health endpoint cannot force a TCP
 	// dial on every request.
@@ -389,6 +390,19 @@ func defaultTrustedProxies() []*net.IPNet {
 		"10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7")
 }
 
+// configuredTrustedProxies uses broad platform-network defaults only when the
+// setting is absent. An explicitly supplied empty or invalid list fails
+// closed, rather than unexpectedly widening trust to every private network.
+func configuredTrustedProxies(trustProxy bool, value string, configured bool) []*net.IPNet {
+	if !trustProxy {
+		return nil
+	}
+	if !configured {
+		return defaultTrustedProxies()
+	}
+	return parseCIDRList(value)
+}
+
 // peerTrusted reports whether ip belongs to one of the configured trusted
 // proxy networks.
 func (s *server) peerTrusted(ip net.IP) bool {
@@ -445,15 +459,23 @@ func peerIPString(r *http.Request) string {
 	return host
 }
 
-// clientIP returns the normalized TCP peer address of the request. Proxy
-// identity headers are never consulted here: clientIdentity decides when
-// forwarded headers may be trusted and extracts them via forwardedIdentity.
-func clientIP(r *http.Request) string {
+// normalizedPeerIP returns the normalized TCP peer address and its parsed IP
+// (when the address is an IP literal). Proxy identity headers are never
+// consulted here; clientIdentity decides when those headers may be trusted.
+func normalizedPeerIP(r *http.Request) (string, net.IP) {
 	host := peerIPString(r)
-	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
-		return ip.String()
+	addr, err := netip.ParseAddr(strings.Trim(host, "[]"))
+	if err != nil {
+		return host, nil
 	}
-	return host
+	addr = addr.WithZone("").Unmap()
+	return addr.String(), net.IP(addr.AsSlice())
+}
+
+// clientIP returns the normalized TCP peer address of the request.
+func clientIP(r *http.Request) string {
+	peer, _ := normalizedPeerIP(r)
+	return peer
 }
 
 // validIdentitySignature reports whether sig is the correct lowercase hex
@@ -464,7 +486,6 @@ func validIdentitySignature(secret, value, sig string) bool {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(value))
 	expected := hex.EncodeToString(mac.Sum(nil))
-	sig = strings.TrimSpace(strings.ToLower(sig))
 	return sig != "" && hmac.Equal([]byte(expected), []byte(sig))
 }
 
@@ -481,19 +502,22 @@ func (s *server) clientIdentity(r *http.Request) (string, error) {
 	if !s.trustProxy {
 		return clientIP(r), nil
 	}
-	// Parse the TCP peer exactly once: the result drives both the
-	// proxy-trust decision and the loopback exemption.
-	peer := net.ParseIP(strings.Trim(peerIPString(r), "[]"))
+	// Parse and normalize the TCP peer once: the result drives the
+	// proxy-trust decision, loopback exemption, and safe fallback identity.
+	peerAddress, peer := normalizedPeerIP(r)
 	loopback := peer != nil && peer.IsLoopback()
 	if !loopback && !s.peerTrusted(peer) {
 		// Untrusted peer: never honor proxy headers.
-		return clientIP(r), nil
+		return peerAddress, nil
 	}
 	var ident string
 	if s.trustSecret != "" {
-		value := strings.TrimSpace(r.Header.Get(s.trustHeader))
+		// Verify the exact header value before normalizing it as an IP. The
+		// signature format is lowercase hex, matching the documented edge
+		// contract; do not silently accept alternate casing or whitespace in it.
+		value := r.Header.Get(s.trustHeader)
 		if value != "" && validIdentitySignature(s.trustSecret, value, r.Header.Get(s.trustHeader+"-Sig")) {
-			if ip := net.ParseIP(strings.Trim(value, "[]")); ip != nil {
+			if ip := net.ParseIP(strings.Trim(strings.TrimSpace(value), "[]")); ip != nil {
 				ident = ip.String()
 			}
 		}
@@ -506,7 +530,7 @@ func (s *server) clientIdentity(r *http.Request) (string, error) {
 	if s.requireIdent && !loopback {
 		return "", errNoClientIdentity
 	}
-	return clientIP(r), nil
+	return peerAddress, nil
 }
 
 func (s *server) backendReady() bool {
@@ -530,7 +554,7 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	// The health endpoint is public, so it gets its own coarse per-client-IP
+	// The health endpoint is public, so it gets its own coarse per-client-identity
 	// budget (independent of the DoH budget) on top of the cached probe. A nil
 	// healthLimiter (hand-built test servers) disables the budget.
 	if s.healthLimiter != nil {
@@ -539,12 +563,20 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 			writeGatewayError(w, http.StatusServiceUnavailable, "client identity unavailable")
 			return
 		}
-		decision, retryAfter := s.healthLimiter.check(ip)
-		if decision != limitAllowed {
-			if decision == limitRateLimited {
-				w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(retryAfter)))
-			}
+		// Apply the same IPv6 prefix grouping as DoH so address rotation
+		// within one routed prefix cannot multiply the public health budget.
+		decision, retryAfter := s.healthLimiter.check(limiterKey(ip, s.v6Prefix))
+		switch decision {
+		case limitAllowed:
+		case limitRateLimited:
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(retryAfter)))
 			writeGatewayError(w, http.StatusTooManyRequests, "rate limit exceeded")
+			return
+		case limitCapacity:
+			writeGatewayError(w, http.StatusServiceUnavailable, "server busy")
+			return
+		default:
+			writeGatewayError(w, http.StatusServiceUnavailable, "server busy")
 			return
 		}
 	}
@@ -790,6 +822,14 @@ func validContentType(value string) bool {
 	return err == nil && strings.EqualFold(mediaType, "application/dns-message")
 }
 
+func isTimeoutError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -877,12 +917,14 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	backendReq.Header.Set("User-Agent", "hagezi-doh/1.0")
 	resp, err := s.client.Do(backendReq)
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
+		// A client disconnect cancels the request context and needs no response.
+		// An independent cancellation from the transport is still an upstream
+		// failure and must not leave the handler's default status as 200.
+		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
 			return
 		}
 		status := http.StatusBadGateway
-		var netErr net.Error
-		if errors.As(err, &netErr) && netErr.Timeout() {
+		if isTimeoutError(err) {
 			status = http.StatusGatewayTimeout
 		}
 		if n, ok := s.upstreamLog.allow(time.Now()); ok {
@@ -899,7 +941,24 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxDNSBody+1))
-	if err != nil || len(responseBody) > maxDNSBody {
+	if err != nil {
+		// Body reads can time out after the backend has already sent response
+		// headers. Classify those failures by the same deadline/timeout rules
+		// as Client.Do instead of incorrectly reporting them as malformed data.
+		if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
+			return
+		}
+		status := http.StatusBadGateway
+		if isTimeoutError(err) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
+		}
+		if n, ok := s.upstreamLog.allow(time.Now()); ok {
+			log.Printf("upstream DNS response read failed: %v%s", err, suppressedNote(n))
+		}
+		writeGatewayError(w, status, "upstream DNS service unavailable")
+		return
+	}
+	if len(responseBody) > maxDNSBody {
 		writeGatewayError(w, http.StatusBadGateway, "invalid upstream DNS response")
 		return
 	}
@@ -957,13 +1016,11 @@ func main() {
 	v6Prefix := parseEnvIPv6Prefix("IPV6_PREFIX", defaultIPv6Prefix)
 	healthRate := parseEnvInt("HEALTH_RATE", defaultHealthRate, maxRateLimit)
 	// Proxy identity headers are honored only from these networks. When
-	// TRUST_PROXY=true and none are configured, trust the ranges a platform
-	// load balancer typically connects from; when TRUST_PROXY=false, never
-	// trust headers regardless of TRUSTED_PROXIES.
-	trustedProxies := parseCIDRList(os.Getenv("TRUSTED_PROXIES"))
-	if trustProxy && len(trustedProxies) == 0 {
-		trustedProxies = defaultTrustedProxies()
-	}
+	// TRUST_PROXY=true and TRUSTED_PROXIES is unset, trust the ranges a
+	// platform load balancer typically connects from; an explicitly supplied
+	// list (including an empty or invalid one) never widens to those defaults.
+	trustedProxyValue, trustedProxyValueSet := os.LookupEnv("TRUSTED_PROXIES")
+	trustedProxies := configuredTrustedProxies(trustProxy, trustedProxyValue, trustedProxyValueSet)
 	// Optional shared secret enabling HMAC-SHA256 verification of the edge-
 	// supplied client identity header; empty keeps the conventional headers.
 	trustSecret := strings.TrimSpace(os.Getenv("TRUST_SECRET"))
@@ -975,9 +1032,11 @@ func main() {
 	// non-loopback trusted proxy that carries no valid identity.
 	requireIdent := parseEnvBool("TRUST_REQUIRE_IDENTITY", true)
 	lim := newLimiter(rate, defaultWindow, maxClients)
+	healthLim := newLimiter(healthRate, defaultWindow, maxClients)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go lim.cleanup(ctx)
+	go healthLim.cleanup(ctx)
 	transport := &http.Transport{
 		MaxIdleConns:           maxConcurrent,
 		MaxIdleConnsPerHost:    maxConcurrent,
@@ -994,12 +1053,12 @@ func main() {
 				return http.ErrUseLastResponse
 			},
 		},
-		backendURL:  defaultBackendURL,
-		backendAddr: defaultBackendAddr,
+		backendURL:     defaultBackendURL,
+		backendAddr:    defaultBackendAddr,
 		limiter:        lim,
 		concurrent:     make(chan struct{}, maxConcurrent),
 		trustProxy:     trustProxy,
-		healthLimiter:  newLimiter(healthRate, defaultWindow, maxClients),
+		healthLimiter:  healthLim,
 		v6Prefix:       v6Prefix,
 		trustedProxies: trustedProxies,
 		trustSecret:    trustSecret,
