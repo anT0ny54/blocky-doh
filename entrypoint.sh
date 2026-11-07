@@ -1,6 +1,6 @@
 #!/bin/sh
-# The supervision and shutdown functions below are only ever invoked through
-# trap handlers, which ShellCheck cannot see.
+# The signal and shutdown handlers below are only ever invoked through trap
+# handlers, which ShellCheck cannot see.
 # shellcheck disable=SC2317
 set -eu
 
@@ -18,12 +18,22 @@ require_unprivileged() {
   what=$1
   value=$2
   p=${value##*:}
-  # strip surrounding quotes, brackets and whitespace
-  p=$(printf '%s' "$p" | sed 's/^[^0-9]*//; s/[^0-9]*$//')
+  # Keep the leading digit run, which drops surrounding quotes, brackets and
+  # whitespace without forking a subshell or sed.
+  p=${p#"${p%%[0-9]*}"}
+  p=${p%%[!0-9]*}
   case $p in
-    ''|*[!0-9]*) return 0 ;;  # non-numeric: let the daemon report its own error
+    '') return 0 ;;  # non-numeric: let the daemon report its own error
   esac
-  if [ "$p" -lt 1024 ]; then
+  # Strip leading zeros so the length test below is exact and the numeric
+  # comparison only ever sees at most four digits (no arithmetic overflow).
+  while :; do
+    case $p in
+      0?*) p=${p#0} ;;
+      *) break ;;
+    esac
+  done
+  if [ "${#p}" -le 4 ] && [ "$p" -lt 1024 ]; then
     printf 'entrypoint: refusing to start: %s requests privileged port :%s,\n' "$what" "$p" >&2
     printf 'entrypoint: the container runs as user "app" without CAP_NET_BIND_SERVICE.\n' >&2
     printf 'entrypoint: use a port >= 1024 (see config.yml and PORT), or grant CAP_NET_BIND_SERVICE.\n' >&2
@@ -33,10 +43,7 @@ require_unprivileged() {
 
 BLOCKY_CONFIG=/etc/blocky/config.yml
 # Listener values under the "ports:" block of the pinned Blocky config.
-# Values contain no whitespace after the awk cleanup, so word splitting is the
-# intended way to iterate them.
-# shellcheck disable=SC2013
-for value in $(awk '
+listeners=$(awk '
   # Blocky accepts scalar, inline-list and block-list listener addresses.
   # Emit each address so every configured port is checked independently.
   function emit_values(value, count, values, i) {
@@ -87,7 +94,15 @@ for value in $(awk '
       emit_values(value)
     }
   }
-' "$BLOCKY_CONFIG"); do
+' "$BLOCKY_CONFIG") || {
+  # Fail closed: an unreadable config must not silently skip the port guard.
+  printf 'entrypoint: cannot read listener ports from %s\n' "$BLOCKY_CONFIG" >&2
+  exit 1
+}
+# Values contain no whitespace after the awk cleanup, so word splitting is the
+# intended way to iterate them.
+# shellcheck disable=SC2086
+for value in $listeners; do
   require_unprivileged "$BLOCKY_CONFIG listener" "$value"
 done
 if [ -n "${PORT:-}" ]; then

@@ -162,10 +162,10 @@ func (l *limiter) checkWithClock(ip string, nowFunc func() time.Time) (limitResu
 	firstLive := sort.Search(len(state.times), func(i int) bool {
 		return state.times[i] > cutoff
 	})
-	if firstLive == len(state.times) {
-		state.times = state.times[:0]
-	} else if firstLive > 0 {
+	if firstLive > 0 {
 		// Compact in place to preserve the slice capacity for future arrivals.
+		// When every timestamp has expired, firstLive equals len and the copy is
+		// empty, so the slice is truncated to zero length.
 		copy(state.times, state.times[firstLive:])
 		state.times = state.times[:len(state.times)-firstLive]
 	}
@@ -320,30 +320,20 @@ type server struct {
 	probeOK bool
 }
 
-func parseEnvInt(name string, def, upper int) int {
+func parseEnvIntRange(name string, def, lower, upper int) int {
 	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
 		return def
 	}
 	n, err := strconv.Atoi(value)
-	if err != nil || n < 1 || n > upper {
+	if err != nil || n < lower || n > upper {
 		return def
 	}
 	return n
 }
 
-// parseEnvIPv6Prefix accepts 0 (disable grouping) through 128; anything else
-// falls back to the default.
-func parseEnvIPv6Prefix(name string, def int) int {
-	value := strings.TrimSpace(os.Getenv(name))
-	if value == "" {
-		return def
-	}
-	n, err := strconv.Atoi(value)
-	if err != nil || n < 0 || n > maxIPv6Prefix {
-		return def
-	}
-	return n
+func parseEnvInt(name string, def, upper int) int {
+	return parseEnvIntRange(name, def, 1, upper)
 }
 
 func parseEnvBool(name string, def bool) bool {
@@ -427,17 +417,10 @@ func (s *server) peerTrusted(ip net.IP) bool {
 // headers (CF-Connecting-IP, then the first valid X-Forwarded-For entry, then
 // X-Real-IP), returning "" when none carries a valid address.
 func forwardedIdentity(r *http.Request) string {
-	parse := func(value string) string {
-		ip := net.ParseIP(strings.Trim(strings.TrimSpace(value), "[]"))
-		if ip == nil {
-			return ""
-		}
-		return ip.String()
-	}
 	// Prefer the header that trusted edges use to carry the original client
 	// address. X-Forwarded-For is then interpreted using its conventional
 	// left-most client address rather than the proxy's right-most address.
-	if ip := parse(r.Header.Get("CF-Connecting-IP")); ip != "" {
+	if ip := identityIP(r.Header.Get("CF-Connecting-IP")); ip != "" {
 		return ip
 	}
 	for _, value := range r.Header.Values("X-Forwarded-For") {
@@ -445,31 +428,33 @@ func forwardedIdentity(r *http.Request) string {
 		for value != "" {
 			var part string
 			part, value, _ = strings.Cut(value, ",")
-			if ip := parse(part); ip != "" {
+			if ip := identityIP(part); ip != "" {
 				return ip
 			}
 		}
 	}
-	if ip := parse(r.Header.Get("X-Real-IP")); ip != "" {
-		return ip
-	}
-	return ""
+	return identityIP(r.Header.Get("X-Real-IP"))
 }
 
-// peerIPString returns the bare TCP peer address of the request.
-func peerIPString(r *http.Request) string {
-	host := strings.TrimSpace(r.RemoteAddr)
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
+// identityIP normalizes a client-supplied address into a rate-limit identity.
+// Surrounding whitespace and one optional bracket pair are tolerated; the
+// result is "" when the value is not an IP address.
+func identityIP(value string) string {
+	ip := net.ParseIP(strings.Trim(strings.TrimSpace(value), "[]"))
+	if ip == nil {
+		return ""
 	}
-	return host
+	return ip.String()
 }
 
 // normalizedPeerIP returns the normalized TCP peer address and its parsed IP
 // (when the address is an IP literal). Proxy identity headers are never
 // consulted here; clientIdentity decides when those headers may be trusted.
 func normalizedPeerIP(r *http.Request) (string, net.IP) {
-	host := peerIPString(r)
+	host := strings.TrimSpace(r.RemoteAddr)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
 	addr, err := netip.ParseAddr(strings.Trim(host, "[]"))
 	if err != nil {
 		return host, nil
@@ -523,9 +508,7 @@ func (s *server) clientIdentity(r *http.Request) (string, error) {
 		// contract; do not silently accept alternate casing or whitespace in it.
 		value := r.Header.Get(s.trustHeader)
 		if value != "" && validIdentitySignature(s.trustSecret, value, r.Header.Get(s.trustHeader+"-Sig")) {
-			if ip := net.ParseIP(strings.Trim(strings.TrimSpace(value), "[]")); ip != nil {
-				ident = ip.String()
-			}
+			ident = identityIP(value)
 		}
 	} else {
 		ident = forwardedIdentity(r)
@@ -1019,7 +1002,8 @@ func main() {
 	maxClients := parseEnvInt("MAX_CLIENTS", defaultMaxClients, maxLimiterClients)
 	maxConcurrent := parseEnvInt("MAX_CONCURRENT", defaultMaxConcurrent, defaultMaxConcurrent)
 	trustProxy := parseEnvBool("TRUST_PROXY", false)
-	v6Prefix := parseEnvIPv6Prefix("IPV6_PREFIX", defaultIPv6Prefix)
+	// IPV6_PREFIX accepts 0 (disable grouping) through 128.
+	v6Prefix := parseEnvIntRange("IPV6_PREFIX", defaultIPv6Prefix, 0, maxIPv6Prefix)
 	healthRate := parseEnvInt("HEALTH_RATE", defaultHealthRate, maxRateLimit)
 	// Proxy identity headers are honored only from these networks. When
 	// TRUST_PROXY=true and TRUSTED_PROXIES is unset, trust the ranges a

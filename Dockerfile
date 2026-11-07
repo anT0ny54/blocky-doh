@@ -1,7 +1,5 @@
-ARG BLOCKY_VERSION=v0.35.0
-
 # Single builder stage to stay within the Small container 2-stage limit.
-FROM golang:1.27.1-alpine AS builder
+FROM golang:1.27.3-alpine3.24 AS builder
 
 RUN apk add --no-cache \
         git \
@@ -12,7 +10,8 @@ ENV CGO_ENABLED=0 \
     GO_SKIP_GENERATE=1 \
     GO_BUILD_FLAGS="-tags static -v"
 
-ARG BLOCKY_VERSION
+# Pinned Blocky release; override with --build-arg BLOCKY_VERSION=<tag>.
+ARG BLOCKY_VERSION=v0.35.0
 
 # ------------------------------------------------------------
 # Build Blocky
@@ -33,8 +32,7 @@ RUN go mod download && \
 # ------------------------------------------------------------
 WORKDIR /src/doh
 
-COPY go.mod ./
-COPY main.go main_test.go ./
+COPY go.mod main.go main_test.go ./
 
 RUN go vet ./... && \
     go test ./... && \
@@ -80,7 +78,7 @@ HEALTHCHECK --interval=30s \
     --timeout=3s \
     --start-period=5s \
     --retries=3 \
-    CMD p="${PORT:-8080}"; \
+    CMD p=$(printf '%s' "${PORT:-}" | tr -d '[:space:]'); p=${p:-8080}; \
         wget -q -O /dev/null "http://127.0.0.1:${p#:}/healthz" || exit 1
 
 USER app:app

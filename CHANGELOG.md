@@ -2,39 +2,31 @@
 
 Entries use the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) style. Only the latest modification set is kept here.
 
-## [Unreleased] - 2026-10-30
+## [Unreleased] - 2026-11-08
 
-Second full-project audit: all 13 files read end to end (gateway, tests,
-Dockerfile, entrypoint, configs, CI workflow, docs), followed by static
-cross-checks — a symbol-reference scan (every function, variable, constant
-and type in `main.go` is referenced from code or tests; all 76 tests and 6
-test helpers are exercised), arithmetic verification of the documented bounds
-(GET raw-query bound 10,927 characters, resource-record cap 743), and a
-claim-by-claim pass of the README against the code, tests, `config.yml` and
-`entrypoint.sh`. No functional behavior changed; the public API, status-code
-matrix and configuration surface are unchanged.
+Re-review of the four-file patch against all 13 project files. No project version bump.
 
-### Fixed
+### Updated
 
-- Precision fix in `README.md` and the `maxDNSResourceRecords` comment in
-  `main.go`: 743 is the maximum *uncompressed* record count that fits an
-  8,192-byte message (compression pointers would allow more); the cap itself
-  is unchanged and remains correct as a conservative bound.
+- `Dockerfile`: updated the builder image from `golang:1.27.1-alpine` to `golang:1.27.3-alpine3.24`. Go 1.27.3 includes a security fix in `crypto/x509`; Go 1.27.2 also includes security fixes in packages including `net/http`.
+- `.github/workflows/Keep-Alive.yml`: upgraded `actions/checkout` from the v5 to the v7 major release.
+- `README.md`: updated the documented build toolchain to Go 1.27.3.
 
-### Verified (no changes required)
+### Review
 
-- Bugs: none found. Re-traced the sliding-window limiter (lock ordering,
-  eviction safety), strict base64url GET decoding, DNS wire validation,
-  upstream response verification, timeout classification and graceful shutdown.
-- Dead/redundant code: none — `clientIP()` is retained because tests exercise
-  it directly; the previously removed unreachable `/healthz` default branch
-  stays removed.
-- Conflicts: none — `go.mod` matches the Dockerfile builder, the
-  `.dockerignore` allow-list matches the Dockerfile `COPY` set, and README
-  claims re-verified against code, tests, `config.yml` and `entrypoint.sh`.
-- Optimizations assessed and rejected: passing `netip.Addr` through
-  `clientIdentity`/`limiterKey` to avoid one IP re-parse per request remains
-  negligible and disruptive to test-facing signatures; the existing
-  optimizations (lazy limiter maps, pooled canonical-name buffers,
-  binary-search expiry, cached health probe, throttled logging) are confirmed
-  in place.
+- Re-read all 13 project files, including the complete gateway and test sources. No dead or redundant Go declarations, confirmed gateway logic defects, or configuration conflicts requiring further source changes were found.
+- The Docker health check already trims whitespace from `PORT` before applying its `8080` default, and the `SC2086` ShellCheck suppression is already directly above the intentional word-splitting loop in `entrypoint.sh`. Neither was changed by this patch.
+- Checked the options used by `config.yml` against the schema shipped with Blocky v0.35.0; the relevant upstream, listener, cache, bootstrap DNS, and query-log settings are supported.
+
+### Verified
+
+- `gofmt -d main.go main_test.go` — clean.
+- `go vet ./...`, `go test -count=1 ./...`, and `go test -race -count=1 ./...` — passed with the locally installed Go 1.23.2 compiler using a temporary copy whose module directive was lowered to `go 1.23` for compatibility. The project's original `go.mod` remains unchanged at `go 1.27`.
+- `sh -n entrypoint.sh` and `busybox sh -n entrypoint.sh` — passed.
+- The Blocky, Compose, and GitHub Actions YAML files parsed successfully.
+- The exact `golang:1.27.3-alpine3.24` image tag and the `actions/checkout` v7 release line were verified against their published registries.
+
+### Not verified
+
+- The actual Go 1.27.3 Docker build and container runtime were not executed because Docker and the Go 1.27.3 toolchain were unavailable in the environment.
+- `shellcheck` was not installed; shell syntax was checked with POSIX `sh` and BusyBox `ash` instead.
