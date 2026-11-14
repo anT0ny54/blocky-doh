@@ -437,14 +437,14 @@ func forwardedIdentity(r *http.Request) string {
 }
 
 // identityIP normalizes a client-supplied address into a rate-limit identity.
-// Surrounding whitespace and one optional bracket pair are tolerated; the
+// Surrounding whitespace and surrounding square brackets are tolerated; the
 // result is "" when the value is not an IP address.
 func identityIP(value string) string {
-	ip := net.ParseIP(strings.Trim(strings.TrimSpace(value), "[]"))
-	if ip == nil {
+	addr, err := netip.ParseAddr(strings.Trim(strings.TrimSpace(value), "[]"))
+	if err != nil {
 		return ""
 	}
-	return ip.String()
+	return addr.WithZone("").Unmap().String()
 }
 
 // normalizedPeerIP returns the normalized TCP peer address and its parsed IP
@@ -1021,6 +1021,11 @@ func main() {
 	// Strict identity: reject (rather than peer-bucket) requests from a
 	// non-loopback trusted proxy that carries no valid identity.
 	requireIdent := parseEnvBool("TRUST_REQUIRE_IDENTITY", true)
+	// TRUST_SECRET and TRUSTED_PROXIES only take effect when TRUST_PROXY=true.
+	// Say so at startup instead of silently ignoring them.
+	if !trustProxy && (trustSecret != "" || trustedProxyValueSet) {
+		log.Printf("warning: TRUST_PROXY=false, so TRUST_SECRET and TRUSTED_PROXIES are ignored")
+	}
 	lim := newLimiter(rate, defaultWindow, maxClients)
 	healthLim := newLimiter(healthRate, defaultWindow, maxClients)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1064,7 +1069,7 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    maxHeaderBytes,
 	}
-	log.Printf("DoH gateway listening on %s; rate=%d requests/%s sliding window; maxClients=%d; maxConcurrent=%d; trustProxy=%t; ipv6Prefix=/%d; healthRate=%d; trustedProxies=%d; trustSecret=%t; requireIdentity=%t", port, rate, defaultWindow, maxClients, maxConcurrent, trustProxy, v6Prefix, healthRate, len(trustedProxies), trustSecret != "", requireIdent)
+	log.Printf("DoH gateway listening on %s; rate=%d requests/%.0fs sliding window; maxClients=%d; maxConcurrent=%d; trustProxy=%t; ipv6Prefix=/%d; healthRate=%d; trustedProxies=%d; trustSecret=%t; requireIdentity=%t", port, rate, defaultWindow.Seconds(), maxClients, maxConcurrent, trustProxy, v6Prefix, healthRate, len(trustedProxies), trustSecret != "", requireIdent)
 	serveErr := make(chan error, 1)
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

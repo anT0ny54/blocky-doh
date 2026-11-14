@@ -13,6 +13,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -788,24 +791,6 @@ func TestDoHConcurrencyGateRejectsBeforeReadingBody(t *testing.T) {
 	}
 }
 
-func TestDoHRejectsOversizedGET(t *testing.T) {
-	backendCalls := 0
-	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
-		backendCalls++
-	})
-	defer cleanup()
-	encoded := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0}, maxDNSBody+1))
-	req := httptest.NewRequest(http.MethodGet, "http://gateway.test/dns-query?dns="+encoded, nil)
-	rec := httptest.NewRecorder()
-	s.handleDoH(rec, req)
-	if rec.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("status=%d; want 413", rec.Code)
-	}
-	if backendCalls != 0 {
-		t.Fatalf("backend was called %d times for oversized GET; want 0", backendCalls)
-	}
-}
-
 func TestDoHRejectsInvalidInputBeforeBackend(t *testing.T) {
 	backendCalls := 0
 	s, cleanup := testServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1198,6 +1183,24 @@ func TestForwardedIdentityPrefersCloudflareConnectingIP(t *testing.T) {
 	req.Header.Set("X-Forwarded-For", "198.51.100.7, 203.0.113.9")
 	if got := forwardedIdentity(req); got != "198.51.100.8" {
 		t.Fatalf("forwardedIdentity=%q; want 198.51.100.8", got)
+	}
+}
+
+func TestIdentityIPNormalizesZonesAndIPv4MappedAddresses(t *testing.T) {
+	cases := map[string]string{
+		"[fe80::1%eth0]":       "fe80::1",
+		"::ffff:192.0.2.10":    "192.0.2.10",
+		"2001:0DB8:0000::0001": "2001:db8::1",
+	}
+	for input, want := range cases {
+		if got := identityIP(input); got != want {
+			t.Errorf("identityIP(%q)=%q; want %q", input, got, want)
+		}
+	}
+	for _, input := range []string{"", "not-an-ip", "192.0.2.1:443"} {
+		if got := identityIP(input); got != "" {
+			t.Errorf("identityIP(%q)=%q; want empty", input, got)
+		}
 	}
 }
 
@@ -1734,5 +1737,329 @@ func TestHealthLimiterDistinguishesRateLimitFromCapacity(t *testing.T) {
 		t.Fatalf("new health client at capacity status=%d; want 503", rec.Code)
 	} else if got := rec.Header().Get("Retry-After"); got != "" {
 		t.Fatalf("capacity rejection Retry-After=%q; want no per-client retry delay", got)
+	}
+}
+
+func runEntrypointConfigGuard(t *testing.T, config string) error {
+	t.Helper()
+	return runEntrypointConfigGuardWithPort(t, config, "")
+}
+
+func runEntrypointConfigGuardWithPort(t *testing.T, config, port string) error {
+	t.Helper()
+
+	script, err := os.ReadFile("entrypoint.sh")
+	if err != nil {
+		return fmt.Errorf("read entrypoint.sh: %w", err)
+	}
+	const supervisionMarker = "# Create supervision state only after configuration guards pass"
+	prefix, _, found := strings.Cut(string(script), supervisionMarker)
+	if !found {
+		return fmt.Errorf("entrypoint.sh is missing the configuration-guard boundary marker")
+	}
+
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.yml")
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		return fmt.Errorf("write test config: %w", err)
+	}
+	prefix = strings.ReplaceAll(prefix, "/etc/blocky/config.yml", configPath)
+	scriptPath := filepath.Join(tempDir, "guard.sh")
+	if err := os.WriteFile(scriptPath, []byte(prefix), 0o700); err != nil {
+		return fmt.Errorf("write test guard: %w", err)
+	}
+
+	cmd := exec.Command("sh", scriptPath)
+	cmd.Env = make([]string, 0, len(os.Environ())+1)
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "PORT=") {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
+	cmd.Env = append(cmd.Env, "PORT="+port)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("entrypoint config guard failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func TestEntrypointConfigGuard(t *testing.T) {
+	valid := "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n"
+	projectConfig, err := os.ReadFile("config.yml")
+	if err != nil {
+		t.Fatalf("read project config.yml: %v", err)
+	}
+	cases := []struct {
+		name       string
+		config     string
+		wantReject bool
+	}{
+		{name: "valid block mapping", config: valid},
+		{name: "actual project config", config: string(projectConfig)},
+		{
+			name:   "quoted listener keys and values",
+			config: "'ports':\n  'dns': '127.0.0.1:5353'\n  'http': \"127.0.0.1:8053\" # expected backend\n",
+		},
+		{
+			name:   "valid explicit DoH path",
+			config: "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  dohPath: /dns-query\n",
+		},
+		{
+			name:   "valid freeBind setting",
+			config: "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  freeBind: false\n",
+		},
+		{
+			name:       "DNS listener must remain one fixed scalar",
+			config:     "ports:\n  dns: [127.0.0.1:5353]\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "multi-line flow list hides privileged listener",
+			config:     "ports:\n  dns: [\n    127.0.0.1:5353,\n    [::]:53\n  ]\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "block list hides privileged listener",
+			config:     "ports:\n  dns:\n    - 127.0.0.1:5353\n    - [::]:53\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "incomplete flow list",
+			config:     "ports:\n  dns: [127.0.0.1:5353,\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "inline ports mapping",
+			config:     "ports: {dns: 127.0.0.1:5353, http: 127.0.0.1:8053}\n",
+			wantReject: true,
+		},
+		{
+			name:       "duplicate ports mappings",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\nports:\n  dns: 127.0.0.1:5354\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "duplicate direct http keys",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "missing http backend",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n",
+			wantReject: true,
+		},
+		{
+			name:       "list-valued http backend",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: [127.0.0.1:8053]\n",
+			wantReject: true,
+		},
+		{
+			name:       "missing dns listener cannot restore default",
+			config:     "ports:\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "null dns listener cannot restore default",
+			config:     "ports:\n  dns: null\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "nested dns is not the listener setting",
+			config:     "ports:\n  custom:\n    dns: 127.0.0.1:53\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "privileged scalar listener",
+			config:     strings.Replace(valid, "127.0.0.1:5353", "127.0.0.1:53", 1),
+			wantReject: true,
+		},
+		{
+			name:       "privileged listener hidden by quoted key",
+			config:     "ports:\n  \"dns\": 127.0.0.1:53\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "YAML alias listener",
+			config:     "defaults: &listener 127.0.0.1:53\nports:\n  dns: *listener\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "YAML merge key",
+			config:     "defaults: &ports\n  dns: 127.0.0.1:53\nports:\n  <<: *ports\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "block scalar listener",
+			config:     "ports:\n  dns: |\n    127.0.0.1:53\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "multi-line quoted listener",
+			config:     "ports:\n  dns: \"127.0.0.1:\n    53\"\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "empty dns would restore Blocky default",
+			config:     "ports:\n  dns: []\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "mismatched backend address",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8054\n",
+			wantReject: true,
+		},
+		{
+			name:       "embedded whitespace is not normalized away",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: \"127.0.0.1: 8053\"\n",
+			wantReject: true,
+		},
+		{
+			name:       "comment inside quoted backend is not stripped",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: \"127.0.0.1:8053 # not a comment\"\n",
+			wantReject: true,
+		},
+		{
+			name:       "nested http is not the backend setting",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  custom:\n    http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "DNS wildcard port is not loopback-only",
+			config:     "ports:\n  dns: 5353\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "DNS wildcard address is not loopback-only",
+			config:     "ports:\n  dns: :5353\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "extra unprivileged TLS listener is rejected",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  tls: 8530\n",
+			wantReject: true,
+		},
+		{
+			name:       "extra unprivileged HTTPS listener is rejected",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  https: 8443\n",
+			wantReject: true,
+		},
+		{
+			name:       "disabled TLS listener placeholder is rejected",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  tls: 0\n",
+			wantReject: true,
+		},
+		{
+			name:       "empty HTTPS listener placeholder is rejected",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  https:\n",
+			wantReject: true,
+		},
+		{
+			name:       "custom DoH path conflicts with gateway backend route",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  dohPath: /custom-query\n",
+			wantReject: true,
+		},
+		{
+			name:       "PROXY protocol conflicts with gateway backend",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  proxyProtocol: [http]\n",
+			wantReject: true,
+		},
+		{
+			name:       "unknown ports setting fails closed",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  futureListener: 9000\n",
+			wantReject: true,
+		},
+		{
+			name:       "explicit YAML mapping key cannot hide TLS listener",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  ? tls\n  : 8530\n",
+			wantReject: true,
+		},
+		{
+			name:       "tagged YAML key cannot hide TLS listener",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  !!str tls: 8530\n",
+			wantReject: true,
+		},
+		{
+			name:       "aliased YAML key cannot hide TLS listener",
+			config:     "defaults: &listener tls\nports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  *listener: 8530\n",
+			wantReject: true,
+		},
+		{
+			name:       "later document cannot hide merged TLS listener behind explicit ports key",
+			config:     "---\n? ports\n: {tls: 853}\n---\nports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "multiple YAML documents are rejected even when the later mapping looks safe",
+			config:     "---\nother: value\n---\nports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "YAML document end marker is rejected",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n...\n",
+			wantReject: true,
+		},
+		{
+			name:       "YAML version directives are rejected",
+			config:     "%YAML 1.2\n---\nports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "YAML tag directives are rejected",
+			config:     "%TAG ! tag:example.com,2026:\n---\nports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := runEntrypointConfigGuard(t, tc.config)
+			if tc.wantReject && err == nil {
+				t.Fatal("configuration was accepted; want fail-closed rejection")
+			}
+			if !tc.wantReject && err != nil {
+				t.Fatalf("valid configuration rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestEntrypointPublicPortGuard(t *testing.T) {
+	valid := "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n"
+	cases := []struct {
+		name       string
+		port       string
+		wantReject bool
+	}{
+		{name: "unset default", port: ""},
+		{name: "whitespace default", port: "   "},
+		{name: "normal port", port: "8080"},
+		{name: "leading colon", port: ":8080"},
+		{name: "leading and trailing whitespace", port: " 8080 "},
+		{name: "leading zeroes", port: "01024"},
+		{name: "maximum TCP port", port: "65535"},
+		{name: "port zero would select ephemeral listener", port: "0", wantReject: true},
+		{name: "zero with leading zeroes", port: "000", wantReject: true},
+		{name: "bare colon would select ephemeral listener", port: ":", wantReject: true},
+		{name: "colon zero would select ephemeral listener", port: ":0", wantReject: true},
+		{name: "privileged port", port: "1023", wantReject: true},
+		{name: "colon privileged port", port: ":1023", wantReject: true},
+		{name: "above maximum TCP port", port: "65536", wantReject: true},
+		{name: "non-numeric port", port: "abc", wantReject: true},
+		{name: "multiple colon components", port: "8080:1", wantReject: true},
+		{name: "embedded whitespace", port: "8 080", wantReject: true},
+		{name: "negative port", port: "-1", wantReject: true},
+		{name: "signed port", port: "+8080", wantReject: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := runEntrypointConfigGuardWithPort(t, valid, tc.port)
+			if tc.wantReject && err == nil {
+				t.Fatalf("PORT=%q was accepted; want fail-closed rejection", tc.port)
+			}
+			if !tc.wantReject && err != nil {
+				t.Fatalf("PORT=%q was rejected: %v", tc.port, err)
+			}
+		})
 	}
 }

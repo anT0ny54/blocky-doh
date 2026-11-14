@@ -1,5 +1,5 @@
 # Single builder stage to stay within the Small container 2-stage limit.
-FROM golang:1.27.3-alpine3.24 AS builder
+FROM golang:1.27.4-alpine3.24 AS builder
 
 RUN apk add --no-cache \
         git \
@@ -32,7 +32,7 @@ RUN go mod download && \
 # ------------------------------------------------------------
 WORKDIR /src/doh
 
-COPY go.mod main.go main_test.go ./
+COPY go.mod main.go main_test.go entrypoint.sh config.yml ./
 
 RUN go vet ./... && \
     go test ./... && \
@@ -47,7 +47,8 @@ RUN go vet ./... && \
 # second copy of the large Blocky binary.
 COPY config.yml entrypoint.sh /out/
 
-RUN sh -n /out/entrypoint.sh && \
+RUN /bin/blocky validate -c /out/config.yml && \
+    sh -n /out/entrypoint.sh && \
     chmod 0555 /out/doh-gateway /out/entrypoint.sh /bin/blocky && \
     chmod 0444 /out/config.yml
 
