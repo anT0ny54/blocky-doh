@@ -1810,6 +1810,29 @@ func TestEntrypointConfigGuard(t *testing.T) {
 			config: "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  freeBind: false\n",
 		},
 		{
+			name:   "UTF-8 byte-order mark before valid ports mapping",
+			config: "\xef\xbb\xbfports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n",
+		},
+		{
+			name:   "CRLF line endings on valid ports mapping",
+			config: "ports:\r\n  dns: 127.0.0.1:5353\r\n  http: 127.0.0.1:8053\r\n",
+		},
+		{
+			name:       "tab-indented listeners are rejected (YAML forbids tab indentation)",
+			config:     "ports:\n\tdns: 127.0.0.1:5353\n\thttp: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "CRLF line endings still reject TLS listener",
+			config:     "ports:\r\n  dns: 127.0.0.1:5353\r\n  http: 127.0.0.1:8053\r\n  tls: 8530\r\n",
+			wantReject: true,
+		},
+		{
+			name:       "byte-order mark does not hide a privileged DNS listener",
+			config:     "\xef\xbb\xbfports:\n  dns: 127.0.0.1:53\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
 			name:       "DNS listener must remain one fixed scalar",
 			config:     "ports:\n  dns: [127.0.0.1:5353]\n  http: 127.0.0.1:8053\n",
 			wantReject: true,
@@ -2061,5 +2084,18 @@ func TestEntrypointPublicPortGuard(t *testing.T) {
 				t.Fatalf("PORT=%q was rejected: %v", tc.port, err)
 			}
 		})
+	}
+}
+
+func TestLimiterKeyIPv4FastPathKeepsIdentityText(t *testing.T) {
+	// IPv4 and unparseable identities skip the netip round trip; their key must
+	// still be the identity text exactly as clientIdentity produced it.
+	for _, ip := range []string{"198.51.100.7", "01.2.3.4", "not-an-ip", ""} {
+		if got := limiterKey(ip, 64); got != ip {
+			t.Fatalf("limiterKey(%q)=%q; want unchanged", ip, got)
+		}
+	}
+	if got := limiterKey("2001:db8:1234:5678::9", 64); got != "2001:db8:1234:5678::/64" {
+		t.Fatalf("IPv6 limiterKey=%q; want the /64 prefix key", got)
 	}
 }

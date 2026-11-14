@@ -142,6 +142,9 @@ listeners=$(awk '
 
   {
     line = $0
+    # Blocky (YAML) accepts a leading UTF-8 byte-order mark; strip it so the
+    # guard reads the same first key that the parser does.
+    if (NR == 1 && substr(line, 1, 3) == sprintf("%c%c%c", 239, 187, 191)) line = substr(line, 4)
 
     # Blocky merges multiple YAML documents in document order. This limited
     # line-oriented guard cannot safely resolve keys introduced or overridden
@@ -191,6 +194,13 @@ listeners=$(awk '
       listener_direct = 0
     }
     if (!inports || line ~ /^[[:space:]]*($|#)/) next
+
+    # YAML forbids tab indentation. Blocky would fail to parse such a block, so
+    # refuse it here as well, so the verdict matches the documented contract.
+    if (line ~ /^ *\t/) {
+      unsupported_yaml = 1
+      next
+    }
 
     if (line ~ /^[[:space:]]+<<[[:space:]]*:/ ||
         line ~ /^[[:space:]]+[&*!?]/) {
@@ -422,6 +432,9 @@ configured_http=$(awk '
   }
   {
     line = $0
+    # Blocky (YAML) accepts a leading UTF-8 byte-order mark; strip it so the
+    # guard reads the same first key that the parser does.
+    if (NR == 1 && substr(line, 1, 3) == sprintf("%c%c%c", 239, 187, 191)) line = substr(line, 4)
     if (is_ports_key(line)) {
       port_blocks++
       inports = 1

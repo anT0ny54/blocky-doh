@@ -224,6 +224,12 @@ func retryAfterSeconds(d time.Duration) int {
 // prefix so a subscriber rotating addresses inside one routed prefix cannot
 // obtain additional windows; a prefix of 0 keeps exact per-address identities.
 func limiterKey(ip string, v6Prefix int) string {
+	// Every IPv4 identity is already canonical dotted form, and only IPv6 can
+	// carry a zone or need prefix masking, so a colon-free value needs no parse.
+	// Anything that does not parse is returned unchanged, as before.
+	if !strings.Contains(ip, ":") {
+		return ip
+	}
 	addr, err := netip.ParseAddr(ip)
 	if err != nil {
 		return ip
@@ -724,6 +730,16 @@ var canonicalNameBufPool = sync.Pool{
 	},
 }
 
+// dnsBufPool recycles the fixed-size buffers that hold an upstream reply, so a
+// steady stream of responses does not allocate a fresh body buffer each time.
+// Each buffer is one byte larger than maxDNSBody so oversize is detectable.
+var dnsBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, maxDNSBody+1)
+		return &buf
+	},
+}
+
 func dnsQuestionEqual(query, response []byte) bool {
 	qBuf := canonicalNameBufPool.Get().(*[]byte)
 	rBuf := canonicalNameBufPool.Get().(*[]byte)
@@ -930,8 +946,12 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, http.StatusBadGateway, "invalid upstream DNS response")
 		return
 	}
-	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxDNSBody+1))
-	if err != nil {
+	// The pooled buffer is one byte larger than the cap, so a reply that is too
+	// big is detected by its length. A short read is normal, not an error.
+	bufp := dnsBufPool.Get().(*[]byte)
+	defer dnsBufPool.Put(bufp)
+	n, err := io.ReadFull(io.LimitReader(resp.Body, int64(len(*bufp))), *bufp)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		// Body reads can time out after the backend has already sent response
 		// headers. Classify those failures by the same deadline/timeout rules
 		// as Client.Do instead of incorrectly reporting them as malformed data.
@@ -948,6 +968,7 @@ func (s *server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		writeGatewayError(w, status, "upstream DNS service unavailable")
 		return
 	}
+	responseBody := (*bufp)[:n]
 	if len(responseBody) > maxDNSBody {
 		writeGatewayError(w, http.StatusBadGateway, "invalid upstream DNS response")
 		return
