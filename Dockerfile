@@ -11,7 +11,7 @@ ENV CGO_ENABLED=0 \
     GO_BUILD_FLAGS="-tags static -v"
 
 # Pinned Blocky release; override with --build-arg BLOCKY_VERSION=<tag>.
-ARG BLOCKY_VERSION=v0.35.0
+ARG BLOCKY_VERSION=v0.36.0
 
 # ------------------------------------------------------------
 # Build Blocky

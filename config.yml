@@ -20,6 +20,9 @@ upstreams:
 ports:
   dns: 127.0.0.1:5353
   http: 127.0.0.1:8053
+# The service does not need pprof; disable the loopback /debug endpoints.
+pprof:
+  enable: false
 caching:
   maxItemsCount: 16384
   prefetching: false

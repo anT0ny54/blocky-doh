@@ -8,47 +8,14 @@ BLOCKY_PID=0
 GATEWAY_PID=0
 SHUTDOWN_DONE=0
 
-# Unprivileged-port guard. The image runs as the unprivileged "app" user
-# without CAP_NET_BIND_SERVICE, so any listener below 1024 dies at bind
-# time with "permission denied" (Blocky on its default :53 logs:
-# "start udp listener failed: listen udp :53: bind: permission denied")
-# and the container crash-loops. Refuse such configurations up front with
-# an error that names the offending setting instead.
-require_unprivileged() {
-  what=$1
-  value=$2
-  p=${value##*:}
-  # Keep the leading digit run, which drops surrounding quotes, brackets and
-  # whitespace without forking a subshell or sed.
-  p=${p#"${p%%[0-9]*}"}
-  p=${p%%[!0-9]*}
-  case $p in
-    '') return 0 ;;  # non-numeric: let the daemon report its own error
-  esac
-  # Strip leading zeros so the length test below is exact and the numeric
-  # comparison only ever sees at most four digits (no arithmetic overflow).
-  while :; do
-    case $p in
-      0?*) p=${p#0} ;;
-      *) break ;;
-    esac
-  done
-  if [ "${#p}" -le 4 ] && [ "$p" -lt 1024 ]; then
-    printf 'entrypoint: refusing to start: %s requests privileged port :%s,\n' "$what" "$p" >&2
-    printf 'entrypoint: the container runs as user "app" without CAP_NET_BIND_SERVICE.\n' >&2
-    printf 'entrypoint: use a port >= 1024 (see config.yml and PORT), or grant CAP_NET_BIND_SERVICE.\n' >&2
-    exit 1
-  fi
-}
-
-# The listener guard accepts only the project’s fixed loopback DNS and HTTP
-# listeners. It understands the limited scalar/list forms needed to fail
-# closed on edits, but DNS itself must remain one scalar address. Extra TLS or
+# The listener guard accepts only the project's fixed loopback DNS and HTTP
+# scalar listeners. It recognizes list continuations only to reject values
+# that would change the fixed listener cardinality. Extra TLS or
 # HTTPS listeners and PROXY protocol are incompatible with this gateway.
 # YAML aliases, merges, tags, block scalars, and multiline quoted values are
 # refused because this small parser cannot safely resolve them.
 BLOCKY_CONFIG=/etc/blocky/config.yml
-listeners=$(awk '
+awk '
   BEGIN { single_quote = sprintf("%c", 39) }
 
   function trim_space(value) {
@@ -134,10 +101,18 @@ listeners=$(awk '
       }
       if (item != "") {
         if (listener == "dns" && listener_direct) dns_value_count++
+        if (listener == "http" && listener_direct) http_value_count++
         if ((listener == "tls" || listener == "https") && listener_direct) forbidden_listener = 1
-        print item
       }
     }
+  }
+
+  function is_boolean_scalar(value) {
+    # Blocky configuration declares freeBind as a YAML bool. Quoted true/false
+    # are YAML strings, so accepting them here would pass the guard but fail
+    # the typed config decoder later.
+    value = trim_space(strip_yaml_comment(value))
+    return value == "true" || value == "false"
   }
 
   {
@@ -172,7 +147,16 @@ listeners=$(awk '
       next
     }
 
+    # Refuse root-level YAML merge keys too. Even when an explicit ports
+    # mapping would take precedence, resolving merged root mappings is outside
+    # this deliberately small YAML subset.
+    if (!inports && line ~ /^<<[[:space:]]*:/) {
+      unsupported_yaml = 1
+      next
+    }
+
     if (is_ports_key(line)) {
+      ports_block_count++
       ports_value = line
       sub(/^ports[[:space:]]*:[[:space:]]*/, "", ports_value)
       sub(/^"ports"[[:space:]]*:[[:space:]]*/, "", ports_value)
@@ -192,6 +176,18 @@ listeners=$(awk '
       inports = 0
       listener = ""
       listener_direct = 0
+    }
+
+    # The project configuration uses ordinary top-level mapping keys. YAML
+    # also permits explicit, tagged, anchored, aliased, and escaped quoted
+    # keys; those forms can decode to a second "ports" key while the simple
+    # line-oriented guard sees only the safe literal mapping. Refuse those
+    # top-level key forms rather than relying on the downstream YAML decoder
+    # to resolve a duplicate or hidden listener mapping.
+    if (!inports && (line ~ /^[&*!?]/ ||
+        line ~ /^"[^"]*\\[^"]*"[[:space:]]*:/)) {
+      unsupported_yaml = 1
+      next
     }
     if (!inports || line ~ /^[[:space:]]*($|#)/) next
 
@@ -268,6 +264,7 @@ listeners=$(awk '
       }
       listener = key
       listener_direct = current_indent == ports_indent
+      if (!listener_direct) unsupported_yaml = 1
       # TLS/HTTPS are forbidden by key presence, even when YAML gives the
       # setting an empty or otherwise false-looking value.
       if ((listener == "tls" || listener == "https") && listener_direct) {
@@ -284,6 +281,18 @@ listeners=$(awk '
         }
         if (dns_candidate == "127.0.0.1:5353") dns_exact = 1
         else dns_exact = 0
+      }
+      if (listener == "http" && listener_direct) {
+        http_key_count++
+        http_candidate = trimmed
+        http_first = substr(http_candidate, 1, 1)
+        http_last = substr(http_candidate, length(http_candidate), 1)
+        if ((http_first == "\"" && http_last == "\"") ||
+            (http_first == single_quote && http_last == single_quote)) {
+          http_candidate = substr(http_candidate, 2, length(http_candidate) - 2)
+        }
+        if (http_candidate == "127.0.0.1:8053") http_exact = 1
+        else http_exact = 0
       }
 
       # Block scalars and multi-line quoted values are valid YAML but are not
@@ -310,7 +319,9 @@ listeners=$(awk '
     }
 
     # A quoted/escaped or otherwise unfamiliar key may decode to a listener
-    # name. Allow the known non-listener ports keys; refuse other quoted keys.
+    # name. The only additional supported field is freeBind, which must be a
+    # direct scalar boolean; nested mappings, aliases, tags, and nulls are not
+    # part of the accepted ports subset.
     key = trim_space(line)
     quote = substr(key, 1, 1)
     if (quote == "\"" || quote == single_quote) {
@@ -318,7 +329,12 @@ listeners=$(awk '
       key_end = index(rest, quote)
       if (key_end > 0 && substr(rest, key_end + 1) ~ /^[[:space:]]*:/) {
         key_name = substr(rest, 1, key_end - 1)
-        if (key_name != "freeBind") unsupported_yaml = 1
+        value = substr(rest, key_end + 1)
+        sub(/^[[:space:]]*:[[:space:]]*/, "", value)
+        if (key_name == "freeBind" && current_indent == ports_indent) free_bind_count++
+        if (key_name != "freeBind" || current_indent != ports_indent || free_bind_count > 1 || !is_boolean_scalar(value)) {
+          unsupported_yaml = 1
+        }
         listener = ""
         listener_direct = 0
         next
@@ -328,10 +344,15 @@ listeners=$(awk '
     if (line ~ /^[[:space:]]+[[:alnum:]_-]+[[:space:]]*:/) {
       key = trim_space(line)
       sub(/[[:space:]]*:.*$/, "", key)
+      value = line
+      sub(/^[[:space:]]+[[:alnum:]_-]+[[:space:]]*:[[:space:]]*/, "", value)
       # Only non-listener fields that do not affect the gateway fixed
       # backend contract are allowed here. In particular, PROXY protocol
       # changes how Blocky accepts the HTTP connection from this gateway.
-      if (key != "freeBind") unsupported_yaml = 1
+      if (key == "freeBind" && current_indent == ports_indent) free_bind_count++
+      if (key != "freeBind" || current_indent != ports_indent || free_bind_count > 1 || !is_boolean_scalar(value)) {
+        unsupported_yaml = 1
+      }
       listener = ""
       listener_direct = 0
       next
@@ -352,31 +373,37 @@ listeners=$(awk '
         next
       }
       emit_values(value)
+      next
+    }
+
+    # A scalar listener (or freeBind boolean) cannot have further indented
+    # content. Reject plain continuations instead of accidentally interpreting
+    # malformed YAML as a second valid scalar.
+    if (line ~ /^[[:space:]]+/) {
+      unsupported_yaml = 1
+      listener = ""
+      listener_direct = 0
+      next
     }
   }
 
   END {
-    # Blocky defaults ports.dns to 53. Require its exact project loopback
-    # address, one scalar ports.dohPath at most (if set), and no extra TLS,
-    # HTTPS, or PROXY-protocol listeners. Do not start on syntax this guard
-    # cannot resolve.
+    # Blocky defaults ports.dns to 53. Require one exact scalar DNS listener,
+    # one exact scalar HTTP backend, and one top-level ports mapping. Permit at
+    # most one scalar ports.dohPath (if set), and reject extra TLS/HTTPS or
+    # PROXY-protocol listeners and syntax this guard cannot resolve.
     if (flow_pending || inline_ports || unsupported_yaml || forbidden_listener ||
-        dns_key_count != 1 || dns_value_count < 1 || !dns_exact ||
+        ports_block_count != 1 || dns_key_count != 1 || dns_value_count != 1 || !dns_exact ||
+        http_key_count != 1 || http_value_count != 1 || !http_exact ||
         doh_path_count > 1 || doh_path_invalid) exit 2
   }
 
-' "$BLOCKY_CONFIG") || {
+' "$BLOCKY_CONFIG" || {
   # Fail closed: an unreadable, incomplete, or unsupported config must not
   # skip the listener-port guard.
   printf 'entrypoint: refusing to start: cannot safely validate the required loopback listener configuration in %s (unreadable, incomplete, conflicting, or unsupported YAML syntax)\n' "$BLOCKY_CONFIG" >&2
   exit 1
 }
-# Values contain no whitespace after the awk cleanup, so word splitting is the
-# intended way to iterate them.
-# shellcheck disable=SC2086
-for value in $listeners; do
-  require_unprivileged "$BLOCKY_CONFIG listener" "$value"
-done
 # The public listener must use a fixed, unprivileged TCP port. Port zero and
 # a bare ':' are accepted by Go as requests for an ephemeral port, but the
 # platform health check probes the configured port and would never reach it.
@@ -410,86 +437,9 @@ validate_public_port() {
 }
 validate_public_port
 
-# The gateway dials its Blocky backend at BACKEND_LISTENER (defaultBackendAddr in
-# main.go). Any other ports.http makes every DoH request fail with 502, so refuse
-# the mismatch at startup rather than running a gateway that cannot answer.
-BACKEND_LISTENER=127.0.0.1:8053
-configured_http=$(awk '
-  BEGIN { single_quote = sprintf("%c", 39) }
-  function trim_space(value) {
-    gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
-    return value
-  }
-  function is_ports_key(line) {
-    return line ~ /^ports[[:space:]]*:/ ||
-      line ~ /^"ports"[[:space:]]*:/ ||
-      line ~ ("^" single_quote "ports" single_quote "[[:space:]]*:")
-  }
-  function is_http_key(line) {
-    return line ~ /^[[:space:]]+http[[:space:]]*:/ ||
-      line ~ /^[[:space:]]+"http"[[:space:]]*:/ ||
-      line ~ ("^[[:space:]]+" single_quote "http" single_quote "[[:space:]]*:")
-  }
-  {
-    line = $0
-    # Blocky (YAML) accepts a leading UTF-8 byte-order mark; strip it so the
-    # guard reads the same first key that the parser does.
-    if (NR == 1 && substr(line, 1, 3) == sprintf("%c%c%c", 239, 187, 191)) line = substr(line, 4)
-    if (is_ports_key(line)) {
-      port_blocks++
-      inports = 1
-      child_indent = -1
-      next
-    }
-    if (inports && line ~ /^[^[:space:]#]/) inports = 0
-    if (!inports || line ~ /^[[:space:]]*($|#)/) next
-
-    # Record the indentation of the first direct child. A nested http key
-    # under another setting must not be mistaken for ports.http.
-    prefix = line
-    sub(/[^[:space:]].*$/, "", prefix)
-    current_indent = length(prefix)
-    if (child_indent < 0) child_indent = current_indent
-
-    if (current_indent == child_indent && is_http_key(line)) {
-      count++
-      value = line
-      sub(/^[[:space:]]+/, "", value)
-      if (substr(value, 1, 1) == "\"") {
-        sub(/^"http"[[:space:]]*:[[:space:]]*/, "", value)
-      } else if (substr(value, 1, 1) == single_quote) {
-        sub(("^" single_quote "http" single_quote "[[:space:]]*:[[:space:]]*"), "", value)
-      } else {
-        sub(/^http[[:space:]]*:[[:space:]]*/, "", value)
-      }
-      value = trim_space(value)
-      # Only accept the exact backend address as a YAML scalar. Optional
-      # matching quotes and a trailing YAML comment are allowed. Do not erase
-      # embedded whitespace or quotes: doing so could validate another value.
-      if (value ~ /^127[.]0[.]0[.]1:8053([[:space:]]+#.*)?$/ ||
-          value ~ /^"127[.]0[.]0[.]1:8053"([[:space:]]+#.*)?$/ ||
-          value ~ ("^" single_quote "127[.]0[.]0[.]1:8053" single_quote "([[:space:]]+#.*)?$")) {
-        value = "127.0.0.1:8053"
-      }
-    }
-  }
-  END {
-    # Duplicate ports mappings, duplicate direct keys, missing keys, and
-    # non-scalar values are ambiguous to this guard. Fail closed rather than
-    # checking a different setting from the one YAML applies.
-    if (port_blocks != 1 || count != 1) exit 1
-    print value
-  }
-' "$BLOCKY_CONFIG") || {
-  printf 'entrypoint: refusing to start: expected exactly one scalar ports.http directly under the top-level ports mapping in %s\n' \
-    "$BLOCKY_CONFIG" >&2
-  exit 1
-}
-if [ "$configured_http" != "$BACKEND_LISTENER" ]; then
-  printf 'entrypoint: refusing to start: ports.http in %s is "%s"; the gateway expects "%s"\n' \
-    "$BLOCKY_CONFIG" "$configured_http" "$BACKEND_LISTENER" >&2
-  exit 1
-fi
+# The first-pass YAML guard above validates exactly one scalar ports.http key
+# at the fixed loopback backend address (127.0.0.1:8053), so no second parse is
+# needed and the two parsers cannot drift apart.
 
 # Create supervision state only after configuration guards pass, so a refused
 # privileged-port configuration does not leave a stale directory in /tmp.

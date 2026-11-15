@@ -1806,8 +1806,22 @@ func TestEntrypointConfigGuard(t *testing.T) {
 			config: "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  dohPath: /dns-query\n",
 		},
 		{
-			name:   "valid freeBind setting",
+			name:   "valid freeBind false boolean",
 			config: "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  freeBind: false\n",
+		},
+		{
+			name:   "valid freeBind true boolean",
+			config: "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  freeBind: true\n",
+		},
+		{
+			name:       "quoted freeBind true is a string, not a YAML boolean",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  freeBind: \"true\"\n",
+			wantReject: true,
+		},
+		{
+			name:       "single-quoted freeBind false is a string, not a YAML boolean",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  'freeBind': 'false'\n",
+			wantReject: true,
 		},
 		{
 			name:   "UTF-8 byte-order mark before valid ports mapping",
@@ -1845,6 +1859,21 @@ func TestEntrypointConfigGuard(t *testing.T) {
 		{
 			name:       "block list hides privileged listener",
 			config:     "ports:\n  dns:\n    - 127.0.0.1:5353\n    - [::]:53\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "block list cannot extend a fixed DNS scalar",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n    - 127.0.0.1:5354\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "block list cannot extend the fixed HTTP scalar",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n    - 127.0.0.1:8054\n",
+			wantReject: true,
+		},
+		{
+			name:       "plain scalar continuation after DNS listener is rejected",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n    127.0.0.1:53\n  http: 127.0.0.1:8053\n",
 			wantReject: true,
 		},
 		{
@@ -1890,6 +1919,11 @@ func TestEntrypointConfigGuard(t *testing.T) {
 		{
 			name:       "nested dns is not the listener setting",
 			config:     "ports:\n  custom:\n    dns: 127.0.0.1:53\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "nested listener cannot follow a scalar listener",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n    tls: 853\n  http: 127.0.0.1:8053\n",
 			wantReject: true,
 		},
 		{
@@ -1993,6 +2027,36 @@ func TestEntrypointConfigGuard(t *testing.T) {
 			wantReject: true,
 		},
 		{
+			name:       "freeBind must be a boolean scalar",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  freeBind: {enabled: false}\n",
+			wantReject: true,
+		},
+		{
+			name:       "freeBind list is rejected",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  freeBind: [false]\n",
+			wantReject: true,
+		},
+		{
+			name:       "freeBind null is rejected",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  freeBind: null\n",
+			wantReject: true,
+		},
+		{
+			name:       "freeBind alias is rejected",
+			config:     "defaults: &enabled true\nports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  freeBind: *enabled\n",
+			wantReject: true,
+		},
+		{
+			name:       "freeBind nested mapping is rejected",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  freeBind:\n    enabled: false\n",
+			wantReject: true,
+		},
+		{
+			name:       "duplicate freeBind keys are rejected",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  freeBind: false\n  freeBind: true\n",
+			wantReject: true,
+		},
+		{
 			name:       "explicit YAML mapping key cannot hide TLS listener",
 			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n  ? tls\n  : 8530\n",
 			wantReject: true,
@@ -2015,6 +2079,36 @@ func TestEntrypointConfigGuard(t *testing.T) {
 		{
 			name:       "multiple YAML documents are rejected even when the later mapping looks safe",
 			config:     "---\nother: value\n---\nports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "escaped top-level key cannot shadow the checked ports mapping",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n\"por\\u0074s\": {tls: 853}\n",
+			wantReject: true,
+		},
+		{
+			name:       "top-level YAML merge key is rejected instead of resolved implicitly",
+			config:     "defaults: &defaults\n  ports:\n    dns: 127.0.0.1:53\n    http: 127.0.0.1:8053\n<<: *defaults\nports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n",
+			wantReject: true,
+		},
+		{
+			name:       "explicit top-level key cannot shadow the checked ports mapping",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n? ports\n: {tls: 853}\n",
+			wantReject: true,
+		},
+		{
+			name:       "tagged top-level key cannot shadow the checked ports mapping",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n!!str ports: {tls: 853}\n",
+			wantReject: true,
+		},
+		{
+			name:       "anchored top-level key cannot shadow the checked ports mapping",
+			config:     "ports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n&portsKey ports: {tls: 853}\n",
+			wantReject: true,
+		},
+		{
+			name:       "aliased top-level key cannot shadow the checked ports mapping",
+			config:     "key: &portsKey ports\nports:\n  dns: 127.0.0.1:5353\n  http: 127.0.0.1:8053\n? *portsKey\n: {tls: 853}\n",
 			wantReject: true,
 		},
 		{
